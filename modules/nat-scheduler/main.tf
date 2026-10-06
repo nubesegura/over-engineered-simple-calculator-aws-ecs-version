@@ -179,8 +179,12 @@ resource "aws_iam_role" "scheduler" {
       Principal = { Service = "scheduler.amazonaws.com" }
       Action    = "sts:AssumeRole"
       Condition = {
-        StringEquals = { "aws:SourceAccount" = local.account_id }
-        ArnLike      = { "aws:SourceArn" = "arn:aws:scheduler:${local.region}:${local.account_id}:schedule/default/evs-${local.name_mid}-nat-*-${var.env_type}" }
+        # EventBridge Scheduler checks the role against the schedule group when it creates a schedule, so the condition names the
+        # group (the default one). The role can only invoke this function, so the wider scope adds no permission.
+        StringEquals = {
+          "aws:SourceAccount" = local.account_id
+          "aws:SourceArn"     = "arn:aws:scheduler:${local.region}:${local.account_id}:schedule-group/default"
+        }
       }
     }]
   })
