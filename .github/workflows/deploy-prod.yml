@@ -1,0 +1,25 @@
+name: Deploy PROD
+
+# Gitflow: every push to main runs the quality gate and then deploys prod. The job of
+# deploy.yml runs in the GitHub environment "prod": the owner configures required reviewers
+# there, so nothing is applied before the manual approval.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+    secrets: inherit

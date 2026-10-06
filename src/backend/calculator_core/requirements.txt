@@ -1,0 +1,24 @@
+# Runtime dependencies for the container services, pinned with == (transitives included).
+# Why each direct one: starlette+uvicorn (ASGI entrypoints), psycopg+psycopg-binary+psycopg-pool (PostgreSQL),
+# boto3 (Secrets Manager, SNS), cryptography (in-memory self-signed certificate).
+anyio==4.15.1
+boto3==1.43.108
+botocore==1.43.108
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.2
+h11==0.16.0
+idna==3.20
+jmespath==1.1.0
+psycopg==3.3.6
+psycopg-binary==3.3.6
+psycopg-pool==3.3.3
+pycparser==3.0
+python-dateutil==2.9.0.post0
+s3transfer==0.19.2
+six==1.17.0
+starlette==1.7.0
+typing_extensions==4.16.0
+tzdata==2026.5
+urllib3==2.8.0
+uvicorn==0.54.0

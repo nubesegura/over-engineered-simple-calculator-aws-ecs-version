@@ -1,0 +1,23 @@
+name: Deploy DEV
+
+# Gitflow: every push to develop runs the quality gate and then deploys dev.
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: dev
+    secrets: inherit

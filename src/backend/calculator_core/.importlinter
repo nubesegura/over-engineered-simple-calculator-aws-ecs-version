@@ -1,0 +1,35 @@
+[importlinter]
+root_package = calculator_core
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = Hexagonal layers: config -> adapters -> application -> domain
+type = layers
+layers =
+    calculator_core.config
+    calculator_core.adapters
+    calculator_core.application
+    calculator_core.domain
+
+[importlinter:contract:core_is_pure]
+name = Domain and application must not depend on web, driver or AWS libraries
+type = forbidden
+source_modules =
+    calculator_core.domain
+    calculator_core.application
+forbidden_modules =
+    boto3
+    botocore
+    starlette
+    uvicorn
+    psycopg
+    psycopg_pool
+    cryptography
+
+[importlinter:contract:inbound_independent]
+name = Inbound adapters must not depend on outbound adapters
+type = forbidden
+source_modules =
+    calculator_core.adapters.inbound
+forbidden_modules =
+    calculator_core.adapters.outbound

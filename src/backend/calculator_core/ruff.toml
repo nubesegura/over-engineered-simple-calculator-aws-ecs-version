@@ -1,0 +1,12 @@
+line-length = 100
+target-version = "py314"
+extend-exclude = [".venv"]
+
+[lint]
+select = ["E", "F", "W", "I", "N", "B", "S", "UP", "SIM"]
+
+[lint.per-file-ignores]
+"**/tests/**" = ["S101"]
+
+[lint.isort]
+known-first-party = ["calculator_core", "tests"]

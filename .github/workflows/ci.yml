@@ -1,0 +1,185 @@
+name: CI
+
+# Quality gates for pull requests and pushes. No deploy step lives in this file.
+on:
+  pull_request:
+  push:
+  workflow_call: # reused by the deploy workflows (rewritten in task 5.4)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+  TERRAFORM_VERSION: "1.16.2"
+  TERRAGRUNT_VERSION: "1.1.5"
+  TFLINT_VERSION: "0.64.0"
+  # sha256 of tflint_linux_amd64.zip of the release above (from its checksums.txt)
+  TFLINT_SHA256: "cca9d13e2e1d7a2c627af60ff899a3c9b74212899416aeb96ec764d2ef954537"
+  CHECKOV_VERSION: "3.3.23"
+
+jobs:
+  python-core:
+    name: Python core (lint, types, layering, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src/backend/calculator_core
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres # throwaway database of the job
+          POSTGRES_DB: calculator_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/calculator_test
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: src/backend/calculator_core/requirements-dev.txt
+
+      - name: Install Dependencies
+        run: pip install -r requirements-dev.txt -e .
+
+      - name: Ruff (lint and format)
+        run: |
+          ruff check ..
+          ruff format --check ..
+
+      - name: Mypy (strict)
+        run: |
+          mypy
+          # One by one: every entrypoint module is named `main`.
+          for entry in ../services/*/main.py; do mypy "$entry"; done
+
+      - name: Import Linter (hexagonal layers)
+        env:
+          PYTHONPATH: src
+        run: lint-imports
+
+      - name: Pytest (coverage >= 85%, PostgreSQL 17)
+        run: pytest
+
+  python-lambdas:
+    name: Python ${{ matrix.folder }} (lint, types, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        folder: [scheduler, rotation]
+    defaults:
+      run:
+        working-directory: src/${{ matrix.folder }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Python
+        if: hashFiles(format('src/{0}/tests/**/test_*.py', matrix.folder)) != ''
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: src/${{ matrix.folder }}/requirements-dev.txt
+
+      - name: Install Dependencies
+        if: hashFiles(format('src/{0}/tests/**/test_*.py', matrix.folder)) != ''
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff (lint and format)
+        if: hashFiles(format('src/{0}/tests/**/test_*.py', matrix.folder)) != ''
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Mypy (strict)
+        if: hashFiles(format('src/{0}/tests/**/test_*.py', matrix.folder)) != ''
+        run: mypy
+
+      - name: Pytest (coverage >= 85%)
+        if: hashFiles(format('src/{0}/tests/**/test_*.py', matrix.folder)) != ''
+        run: pytest
+
+  iac:
+    name: IaC (format, validate, tflint, checkov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Terragrunt (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo terragrunt_linux_amd64 "$base/terragrunt_linux_amd64"
+          curl -fsSLo SHA256SUMS "$base/SHA256SUMS"
+          grep " terragrunt_linux_amd64$" SHA256SUMS | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 terragrunt_linux_amd64 "$HOME/.local/bin/terragrunt"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install tflint (pinned checksum)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLo tflint.zip "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_amd64.zip"
+          echo "${TFLINT_SHA256}  tflint.zip" | sha256sum -c -
+          unzip -q tflint.zip tflint
+          install -m 0755 tflint "$HOME/.local/bin/tflint"
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Terragrunt HCL Format
+        run: terragrunt hcl fmt --check --working-dir environments
+
+      - name: Terraform Init and Validate (each module)
+        run: |
+          set -euo pipefail
+          for dir in modules/*/; do
+            echo "::group::${dir}"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - name: Tflint
+        run: tflint --recursive --chdir modules
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Checkov
+        run: |
+          pip install "checkov==${CHECKOV_VERSION}"
+          checkov -d modules --framework terraform --compact --quiet

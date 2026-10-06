@@ -1,0 +1,34 @@
+# Tooling for local work and CI (not installed in the images). Install with: pip install -r requirements.txt -r requirements-dev.txt moto is the AWS mock of the Secrets Manager and SNS adapter tests. httpx is the transport of the Starlette test client.
+-r requirements.txt
+ast_serialize==0.12.1
+certifi==2026.7.22
+charset-normalizer==3.5.2
+click==8.5.0
+colorama==0.4.6
+coverage==7.16.2
+grimp==3.17
+httpcore==1.0.9
+httpx==0.28.1
+import-linter==2.15
+iniconfig==2.3.0
+librt==0.16.0
+markdown-it-py==4.2.0
+MarkupSafe==3.0.4
+mdurl==0.1.2
+moto==5.2.3
+mypy==2.4.0
+mypy_extensions==1.1.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.6.0
+Pygments==2.21.0
+pytest-cov==7.1.0
+pytest==9.1.1
+PyYAML==6.0.3
+requests==2.34.2
+responses==0.26.3
+rich==15.0.0
+ruff==0.16.10
+typing_extensions==4.16.0
+Werkzeug==3.1.9
+xmltodict==1.0.4

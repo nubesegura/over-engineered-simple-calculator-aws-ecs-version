@@ -1,0 +1,29 @@
+[project]
+name = "db_rotation"
+version = "0.1.0"
+description = "Secrets Manager rotation Lambda for the application database credential"
+requires-python = ">=3.14"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "S", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["db_rotation"]
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+packages = ["db_rotation", "tests"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=db_rotation --cov-report=term-missing --cov-fail-under=85"
+testpaths = ["tests"]
+pythonpath = ["."]

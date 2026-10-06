@@ -1,0 +1,313 @@
+name: Deploy (reusable)
+
+# Deploys one whole environment, in two Terragrunt phases around the image build and the
+# database migration. Called by deploy-dev.yml and deploy-prod.yml (after ci.yml); the GitHub
+# environment of the same name provides the secrets, the variables and, for prod, the manual
+# approval gate (required reviewers: the owner configures it in the GitHub environment).
+#
+# Order: validate -> OIDC role and account check -> phase 1 (security, network, scheduler,
+# registry, storage, database, rotation, cluster) -> NAT on -> build and push seven images
+# -> migration task -> phase 2 (edge, services, ingestion, alarms) -> smoke test.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (dev or prod); also the GitHub environment name
+        required: true
+        type: string
+
+permissions:
+  id-token: write # Required for requesting the JWT for AWS OIDC
+  contents: read # Required for actions/checkout
+
+env:
+  # Same versions as ci.yml.
+  TERRAFORM_VERSION: "1.16.2"
+  TERRAGRUNT_VERSION: "1.1.5"
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: ${{ inputs.environment }}
+    # Never run two applies against the same state at once, and never cancel one in progress.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: environments/${{ inputs.environment }}
+    env:
+      # Read by env.hcl and the common unit files.
+      SUPPORT_EMAIL: ${{ secrets.SUPPORT_EMAIL }}
+      COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+      COGNITO_APP_CLIENT_ID: ${{ vars.COGNITO_APP_CLIENT_ID }}
+      WAF_ACL_ARN: ${{ vars.WAF_ACL_ARN }}
+      TG_NON_INTERACTIVE: "true"
+      TG_BACKEND_BOOTSTRAP: "true" # the state bucket is created by Terragrunt on first use
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Each environment is a different AWS account, and the branch decides which one:
+      # develop -> dev, main -> prod. A run from any other branch must never assume a role.
+      - name: Validate branch for the environment
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          case "$TARGET:$GITHUB_REF" in
+            dev:refs/heads/develop | prod:refs/heads/main) ;;
+            *)
+              echo "::error::Branch $GITHUB_REF cannot deploy the '$TARGET' environment"
+              exit 1
+              ;;
+          esac
+
+      - name: Validate environment configuration
+        env:
+          TARGET: ${{ inputs.environment }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ROLE_ARN_SET: ${{ secrets.ROLE_ARN != '' }}
+          SUPPORT_EMAIL_SET: ${{ secrets.SUPPORT_EMAIL != '' }}
+          AWS_ACCOUNT_ID_SET: ${{ secrets.AWS_ACCOUNT_ID != '' }}
+        run: |
+          missing=0
+          for secret in ROLE_ARN AWS_ACCOUNT_ID SUPPORT_EMAIL; do
+            flag="${secret}_SET"
+            if [ "${!flag}" != "true" ]; then
+              echo "::error::Secret '$secret' is not set in the '$TARGET' GitHub environment"
+              missing=1
+            fi
+          done
+          # The Cognito pool is created by the webpage repository; the owner copies its values.
+          for name in AWS_REGION COGNITO_USER_POOL_ID COGNITO_APP_CLIENT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Variable '$name' is not set in the '$TARGET' GitHub environment"
+              missing=1
+            fi
+          done
+          # prod associates the shared regional WAF ACL (enable_waf = true in env.hcl).
+          if [ "$TARGET" = "prod" ] && [ -z "$WAF_ACL_ARN" ]; then
+            echo "::error::Variable 'WAF_ACL_ARN' is not set in the 'prod' GitHub environment"
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          # The provider region comes from env.hcl: the credentials must target the same one.
+          if ! grep -qE "^\s*aws_region\s*=\s*\"$AWS_REGION\"" env.hcl; then
+            echo "::error file=environments/$TARGET/env.hcl::AWS_REGION does not match aws_region in env.hcl"
+            exit 1
+          fi
+          # Every unit of both phases must exist (the modules arrive in separate tasks).
+          for unit in security network scheduler registry storage database rotation cluster edge services ingestion alarms; do
+            if [ ! -f "$unit/terragrunt.hcl" ]; then
+              echo "::error::Unit environments/$TARGET/$unit/terragrunt.hcl does not exist"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          role-session-name: gha-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify target AWS account
+        env:
+          EXPECTED_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "::add-mask::$ACTUAL_ACCOUNT"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_ACCOUNT" ]; then
+            echo "::error::The credentials do not point to the AWS account configured for this GitHub environment"
+            exit 1
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Terragrunt (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo terragrunt_linux_amd64 "$base/terragrunt_linux_amd64"
+          curl -fsSLo SHA256SUMS "$base/SHA256SUMS"
+          grep " terragrunt_linux_amd64$" SHA256SUMS | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 terragrunt_linux_amd64 "$HOME/.local/bin/terragrunt"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The commit SHA is the image tag of every image and of the migration task definition.
+      - name: Set image tag
+        run: echo "IMAGE_TAG=$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      # Terragrunt orders the selected units by their dependencies.
+      - name: Phase 1 apply (foundation, data and cluster)
+        run: |
+          terragrunt run --all \
+            --filter './security' --filter './network' --filter './scheduler' \
+            --filter './registry' --filter './storage' --filter './database' \
+            --filter './rotation' --filter './cluster' \
+            apply
+
+      # The private subnets have no internet route until the NAT exists (it is removed every
+      # night). Image pulls, the migration and the services need it from here on.
+      - name: Ensure egress (NAT on)
+        run: |
+          set -euo pipefail
+          FUNCTION_NAME=$(terragrunt --working-dir scheduler output -raw function_name)
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --payload '{"action":"on"}' \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 900 \
+            --query FunctionError --output text \
+            "$RUNNER_TEMP/scheduler-response.json" > "$RUNNER_TEMP/scheduler-error.txt"
+          ERROR=$(cat "$RUNNER_TEMP/scheduler-error.txt")
+          if [ "$ERROR" != "None" ]; then
+            echo "::error::The scheduler function returned an error ($ERROR) when turning the NAT on"
+            exit 1
+          fi
+          echo "NAT scheduler invoked with action 'on'"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Seven images (linux/arm64) from src/backend, build argument SERVICE. Repositories are
+      # immutable: a tag that already exists is not pushed again (a re-run of the same commit).
+      # The seventh (SERVICE=migrate) goes to the history repository as migrate-<sha>, the tag the
+      # cluster unit gives the migration task.
+      - name: Build and push images
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          REPOSITORY_URLS=$(terragrunt --working-dir "environments/$TARGET/registry" output -json repository_urls)
+          REGISTRY=$(echo "$REPOSITORY_URLS" | jq -r '.history | split("/")[0]')
+          echo "::add-mask::$REGISTRY"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY" > /dev/null
+
+          # key (registry output) : SERVICE build argument : tag prefix
+          for entry in add:calc-add: sub:calc-sub: mul:calc-mul: div:calc-div:                        history:history: ingest:ingest: history:migrate:migrate-; do
+            key="${entry%%:*}"
+            rest="${entry#*:}"
+            service="${rest%%:*}"
+            prefix="${rest#*:}"
+            tag="$prefix$IMAGE_TAG"
+            url=$(echo "$REPOSITORY_URLS" | jq -r --arg key "$key" '.[$key]')
+            repository="${url#*/}"
+            if aws ecr describe-images --repository-name "$repository" \
+                 --image-ids "imageTag=$tag" > /dev/null 2> "$RUNNER_TEMP/describe.err"; then
+              echo "Image $repository:$tag already exists; push skipped"
+              continue
+            fi
+            if ! grep -q "ImageNotFoundException" "$RUNNER_TEMP/describe.err"; then
+              echo "::error::Could not check the image tag in repository $repository"
+              exit 1
+            fi
+            echo "::group::Build and push $repository:$tag"
+            docker buildx build \
+              --platform linux/arm64 \
+              --build-arg "SERVICE=$service" \
+              --provenance=false --sbom=false \
+              --tag "$url:$tag" \
+              --push \
+              src/backend
+            echo "::endgroup::"
+          done
+
+      # Database schema migration and application login password, as a one-off Fargate task.
+      - name: Run the migration task
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          CLUSTER=$(terragrunt --working-dir cluster output -raw cluster_name)
+          FAMILY=$(terragrunt --working-dir cluster output -raw migrate_task_definition_family)
+          SUBNETS=$(terragrunt --working-dir cluster output -json migrate_subnet_ids | jq -r 'join(",")')
+          SECURITY_GROUP=$(terragrunt --working-dir cluster output -raw migrate_security_group_id)
+          LOG_GROUP=$(terragrunt --working-dir cluster output -raw migrate_log_group_name)
+          echo "Migration task logs: CloudWatch log group $LOG_GROUP"
+
+          RUN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$FAMILY" \
+            --launch-type FARGATE \
+            --count 1 \
+            --started-by "gha-$GITHUB_RUN_ID" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}")
+          FAILURES=$(echo "$RUN" | jq -r '.failures | length')
+          if [ "$FAILURES" != "0" ]; then
+            echo "::error::The migration task could not be started: $(echo "$RUN" | jq -c '.failures')"
+            exit 1
+          fi
+          TASK_ARN=$(echo "$RUN" | jq -r '.tasks[0].taskArn')
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+          DESCRIPTION=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN")
+          EXIT_CODE=$(echo "$DESCRIPTION" | jq -r '.tasks[0].containers[0].exitCode // "none"')
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::The migration task finished with exit code '$EXIT_CODE' (stop reason: $(echo "$DESCRIPTION" | jq -r '.tasks[0].stoppedReason // "unknown"')); read the log group $LOG_GROUP"
+            exit 1
+          fi
+          echo "Migration task finished with exit code 0"
+
+      - name: Phase 2 apply (edge, services, ingestion, alarms)
+        run: |
+          terragrunt run --all \
+            --filter './edge' --filter './services' \
+            --filter './ingestion' --filter './alarms' \
+            apply
+
+      # The API host name is api. + the host of web_origin (the web page origin of env.hcl).
+      # Its DNS record is owned by the webpage repository and may point to another backend, so
+      # the test connects to this load balancer directly and keeps the real host name for the
+      # certificate check and the Host header (curl --connect-to).
+      - name: Smoke test (through the load balancer)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          ORIGIN=$(sed -n 's/^[[:space:]]*web_origin[[:space:]]*=[[:space:]]*"\(https:\/\/[^"]*\)".*/\1/p' env.hcl)
+          if [ -z "$ORIGIN" ]; then
+            echo "::error::web_origin not found in env.hcl"
+            exit 1
+          fi
+          API_HOST="api.${ORIGIN#https://}"
+          ALB_DNS=$(terragrunt --working-dir edge output -raw alb_dns_name)
+          URL="https://$API_HOST/api/v1/add"
+
+          # Retries cover the registration of the targets of the first deployment.
+          ok=0
+          for attempt in $(seq 1 10); do
+            AUTH_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "$API_HOST:443:$ALB_DNS:443" \
+              -X POST "$URL" -H "Content-Type: application/json" -d '{"a": 2, "b": 3}' || true)
+            PREFLIGHT_STATUS=$(curl -s -o /dev/null -D "$RUNNER_TEMP/preflight.headers" -w '%{http_code}' \
+              --connect-to "$API_HOST:443:$ALB_DNS:443" -X OPTIONS "$URL" \
+              -H "Origin: $ORIGIN" -H "Access-Control-Request-Method: POST" \
+              -H "Access-Control-Request-Headers: authorization,content-type" || true)
+            ALLOWED_ORIGIN=$(grep -i '^access-control-allow-origin:' "$RUNNER_TEMP/preflight.headers" 2> /dev/null | tr -d '\r' | cut -d' ' -f2- || true)
+            if [ "$AUTH_STATUS" = "401" ] \
+               && { [ "$PREFLIGHT_STATUS" = "204" ] || [ "$PREFLIGHT_STATUS" = "200" ]; } \
+               && [ "$ALLOWED_ORIGIN" = "$ORIGIN" ]; then
+              ok=1
+              break
+            fi
+            echo "Attempt $attempt: POST without token -> '$AUTH_STATUS' (expected 401); OPTIONS -> '$PREFLIGHT_STATUS' (expected 204 or 200) with allowed origin '$ALLOWED_ORIGIN'; retrying in 15 seconds"
+            sleep 15
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Smoke test failed against https://$API_HOST/api/v1/add through the load balancer"
+            exit 1
+          fi
+          echo "Smoke test passed: POST without a token -> 401; preflight -> $PREFLIGHT_STATUS with the allowed origin"

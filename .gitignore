@@ -1,0 +1,34 @@
+# Local working folders (never versioned; archived by the closing stage)
+specs/
+ai-related-docs/
+CLAUDE.md
+.claude/
+
+# Reference material used while building the project
+references/
+
+# Local sample data (CSV files used to exercise the ingestion flow)
+sample-data/
+
+# Terragrunt / Terraform generated files
+**/.terragrunt-cache/
+**/.terraform/
+**/backend.tf
+**/provider.tf
+**/*.tfplan
+**/tfplan
+**/local.tfvars
+environments/*/secrets.yml
+
+# Python tooling
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/.import_linter_cache/
+
+# Lambda packages built by scripts/package_rotation.py
+.build/

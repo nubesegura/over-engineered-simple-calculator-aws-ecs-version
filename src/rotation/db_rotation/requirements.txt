@@ -1,0 +1,7 @@
+# Runtime dependencies of the rotation function (boto3 comes with the Lambda runtime).
+# Pinned with transitives; install into the package folder when building the zip.
+asn1crypto==1.5.1
+pg8000==1.31.5
+python-dateutil==2.9.0.post0
+scramp==1.4.17
+six==1.17.0
