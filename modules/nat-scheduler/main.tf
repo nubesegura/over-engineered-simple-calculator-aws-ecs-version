@@ -25,7 +25,7 @@ locals {
 # ---------------------------------------------------------
 data "archive_file" "function" {
   type        = "zip"
-  source_dir  = "${path.module}/../../src/scheduler/nat_scheduler"
+  source_dir  = var.handler_source_dir
   output_path = "${path.module}/build/nat-scheduler.zip"
   excludes    = ["__pycache__", "requirements.txt"]
 }

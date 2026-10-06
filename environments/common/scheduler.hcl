@@ -30,6 +30,7 @@ dependency "security" {
 }
 
 inputs = {
+  handler_source_dir     = "${get_repo_root()}/src/scheduler/nat_scheduler"
   public_subnet_id       = dependency.network.outputs.nat_public_subnet_id
   private_route_table_id = dependency.network.outputs.private_route_table_id
   eip_allocation_id      = dependency.network.outputs.nat_eip_allocation_id

@@ -75,3 +75,13 @@ variable "function_timeout_seconds" {
   description = "Function timeout; it must cover the wait for the NAT gateway to become available"
   default     = 300
 }
+
+variable "handler_source_dir" {
+  description = "Absolute path of the folder with the function code. Terragrunt copies only this module to its cache, so the unit passes the path from the repository root."
+  type        = string
+
+  validation {
+    condition     = length(var.handler_source_dir) > 0
+    error_message = "handler_source_dir must not be empty."
+  }
+}
