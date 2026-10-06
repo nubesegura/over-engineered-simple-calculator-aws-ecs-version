@@ -149,47 +149,47 @@ resource "aws_default_security_group" "default" {
   vpc_id = aws_vpc.main.id
 
   tags = {
-    Name = "sg-${local.name_mid}-default-${var.env_type}"
+    Name = "sgp-${local.name_mid}-default-${var.env_type}"
   }
 }
 
 resource "aws_security_group" "alb" {
-  name        = "sg-${local.name_mid}-alb-${var.env_type}"
+  name        = "sgp-${local.name_mid}-alb-${var.env_type}"
   description = "Load balancer: HTTPS and HTTP from the internet, egress to the tasks only"
   vpc_id      = aws_vpc.main.id
 
   tags = {
-    Name = "sg-${local.name_mid}-alb-${var.env_type}"
+    Name = "sgp-${local.name_mid}-alb-${var.env_type}"
   }
 }
 
 resource "aws_security_group" "svc" {
-  name        = "sg-${local.name_mid}-svc-${var.env_type}"
+  name        = "sgp-${local.name_mid}-svc-${var.env_type}"
   description = "HTTP services: task port from the load balancer, egress 443 and database"
   vpc_id      = aws_vpc.main.id
 
   tags = {
-    Name = "sg-${local.name_mid}-svc-${var.env_type}"
+    Name = "sgp-${local.name_mid}-svc-${var.env_type}"
   }
 }
 
 resource "aws_security_group" "job" {
-  name        = "sg-${local.name_mid}-job-${var.env_type}"
+  name        = "sgp-${local.name_mid}-job-${var.env_type}"
   description = "Jobs (ingest, migrate, rotation): no ingress, egress 443 and database"
   vpc_id      = aws_vpc.main.id
 
   tags = {
-    Name = "sg-${local.name_mid}-job-${var.env_type}"
+    Name = "sgp-${local.name_mid}-job-${var.env_type}"
   }
 }
 
 resource "aws_security_group" "db" {
-  name        = "sg-${local.name_mid}-db-${var.env_type}"
+  name        = "sgp-${local.name_mid}-db-${var.env_type}"
   description = "PostgreSQL: database port only from the services and jobs groups"
   vpc_id      = aws_vpc.main.id
 
   tags = {
-    Name = "sg-${local.name_mid}-db-${var.env_type}"
+    Name = "sgp-${local.name_mid}-db-${var.env_type}"
   }
 }
 
