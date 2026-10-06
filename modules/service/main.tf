@@ -186,6 +186,9 @@ resource "aws_ecs_task_definition" "svc" {
         { name = "DB_NAME", value = var.db_name },
         { name = "ALERT_TOPIC_ARN", value = var.alert_topic_arn },
         { name = "CORS_ALLOWED_ORIGIN", value = var.cors_allowed_origin },
+        # Fargate mounts the ephemeral volume at /tmp owned by root, which the non-root user of the image cannot write to.
+        # /dev/shm is a writable in-memory mount even with a read-only root filesystem, and the key never touches a disk.
+        { name = "TLS_DIRECTORY", value = "/dev/shm" },
       ]
 
       logConfiguration = {
