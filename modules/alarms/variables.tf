@@ -55,17 +55,17 @@ variable "ingest_rule_arn" {
 
 variable "service_cpu_threshold_percent" {
   type        = number
-  description = "ECS service CPU utilization (percent) above which the alarm fires"
+  description = "ECS service CPU utilization (percent) at or above which the alarm fires"
 }
 
 variable "alb_5xx_threshold" {
   type        = number
-  description = "Load balancer generated 5XX responses per 5 minutes above which the alarm fires"
+  description = "Load balancer generated 5XX responses per 5 minutes at or above which the alarm fires"
 }
 
 variable "target_5xx_threshold" {
   type        = number
-  description = "Target (application) 5XX responses per 5 minutes above which the alarm fires"
+  description = "Target (application) 5XX responses per 5 minutes at or above which the alarm fires"
 }
 
 variable "db_free_storage_threshold_bytes" {
@@ -75,10 +75,10 @@ variable "db_free_storage_threshold_bytes" {
 
 variable "db_connections_threshold" {
   type        = number
-  description = "RDS connection count above which the alarm fires"
+  description = "RDS connection count at or above which the alarm fires"
 }
 
 variable "db_cpu_threshold_percent" {
   type        = number
-  description = "RDS CPU utilization (percent) above which the alarm fires"
+  description = "RDS CPU utilization (percent) at or above which the alarm fires"
 }

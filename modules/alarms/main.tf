@@ -72,14 +72,14 @@ resource "aws_cloudwatch_metric_alarm" "healthy_hosts" {
 # ---------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   alarm_name          = "alrm-${local.name_mid}-alb-5xx-${var.env_type}"
-  alarm_description   = "The load balancer itself returned more than ${var.alb_5xx_threshold} 5XX responses in 5 minutes"
+  alarm_description   = "The load balancer itself returned at least ${var.alb_5xx_threshold} 5XX responses in 5 minutes"
   namespace           = "AWS/ApplicationELB"
   metric_name         = "HTTPCode_ELB_5XX_Count"
   statistic           = "Sum"
   period              = 300
   evaluation_periods  = 1
   threshold           = var.alb_5xx_threshold
-  comparison_operator = "GreaterThanThreshold"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
 
   dimensions = {

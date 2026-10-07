@@ -28,7 +28,7 @@ The API answers on `/api/v1` (shared by every backend) and `/api/ecs/v1` (its ow
 | `modules/` | Terraform modules |
 | `environments/` | Terragrunt root, common units and `dev` / `prod` settings (`env.hcl`) |
 | `.github/workflows/` | `ci.yml` and the deployment workflows (`develop` deploys `dev`, `main` deploys `prod`) |
-| `docs/` | Architecture (resource inventory and diagram) |
+| `docs/` | [Functional](docs/functional.md), [technical](docs/technical.md), [architecture](docs/architecture.md) (resource inventory and diagram) and [decisions](docs/adr/README.md) |
 
 ## Checks
 
@@ -51,4 +51,4 @@ GitHub environment `dev` or `prod` needs the secrets `ROLE_ARN`, `AWS_ACCOUNT_ID
 published the API certificate (`/oecalc/<env>/api-certificate-arn`) first. The workflow applies the foundation units, builds and
 pushes the images, runs the migration, applies the load balancer, services, ingestion and alarms, and ends with a smoke test.
 
-Test project: raise it, review it and destroy it. Destroying `prod` first needs the deletion protection lifted.
+Test project: raise it, review it and destroy it. Retirement order (weights back to `sls` first, deletion protection lifted in `prod`) is in [docs/functional.md](docs/functional.md#retirement-of-the-test-deployment).
