@@ -155,7 +155,7 @@ resource "aws_default_security_group" "default" {
 
 resource "aws_security_group" "alb" {
   name        = "sgp-${local.name_mid}-alb-${var.env_type}"
-  description = "Load balancer: HTTPS and HTTP from the internet, egress to the tasks only"
+  description = "Load balancer: HTTPS and HTTP from the internet, egress to the tasks and HTTPS for the JWKS download"
   vpc_id      = aws_vpc.main.id
 
   tags = {
@@ -220,6 +220,17 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_svc" {
   from_port                    = var.task_port
   to_port                      = var.task_port
   referenced_security_group_id = aws_security_group.svc.id
+}
+
+# The JWT verification rule downloads the public signing keys of the token issuer (Cognito JWKS) over HTTPS from the load
+# balancer nodes; without this rule the request fails with JWKSRequestTimeout (HTTP 500). No application data leaves here.
+resource "aws_vpc_security_group_egress_rule" "alb_jwks" {
+  security_group_id = aws_security_group.alb.id
+  description       = "Load balancer to the token issuer public keys (JWKS) over HTTPS"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
 }
 
 # Services

@@ -19,7 +19,7 @@ Names follow `<acronym>-useast2-oecalc-<descriptor>-<env>` (`<env>` is `dev` or 
 | 7 | Route tables (public, private) | `aws_route_table` | `rtb-useast2-oecalc-public-<env>`, `-private-` | Routing; the private default route to the NAT is created and deleted by the scheduler Lambda | Both | network |
 | 8 | S3 gateway endpoint | `aws_vpc_endpoint` | `vpce-useast2-oecalc-s3-<env>` | Free path to S3 (image layers, ingestion) without NAT traffic | Both | network |
 | 9 | Default security group, locked | `aws_default_security_group` | (default, no rules) | VPC-02 | Both | network |
-| 10 | Security group, load balancer (prefix `sgp`: AWS forbids names that start with `sg-`) | `aws_security_group` | `sgp-useast2-oecalc-alb-<env>` | 443 and 80 from the internet; egress to tasks only | Both | network |
+| 10 | Security group, load balancer (prefix `sgp`: AWS forbids names that start with `sg-`) | `aws_security_group` | `sgp-useast2-oecalc-alb-<env>` | 443 and 80 from the internet; egress to tasks (task port) and 443 for the JWKS download of the JWT rule | Both | network |
 | 11 | SG services | `aws_security_group` | `sgp-useast2-oecalc-svc-<env>` | Task port only from the ALB group; egress 443 and database port | Both | network |
 | 12 | SG jobs (ingest, migrate) | `aws_security_group` | `sgp-useast2-oecalc-job-<env>` | No ingress; egress 443 and database port | Both | network |
 | 13 | SG database | `aws_security_group` | `sgp-useast2-oecalc-db-<env>` | 5432 only from services and jobs groups | Both | network |
