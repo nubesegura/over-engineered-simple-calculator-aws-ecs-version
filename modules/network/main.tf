@@ -155,7 +155,7 @@ resource "aws_default_security_group" "default" {
 
 resource "aws_security_group" "alb" {
   name        = "sgp-${local.name_mid}-alb-${var.env_type}"
-  description = "Load balancer: HTTPS and HTTP from the internet, egress to the tasks and HTTPS for the JWKS download"
+  description = "Load balancer: HTTPS and HTTP from the internet, egress to the tasks only"
   vpc_id      = aws_vpc.main.id
 
   tags = {
