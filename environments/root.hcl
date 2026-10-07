@@ -12,8 +12,8 @@ locals {
   context     = "oecalc"
   region_code = replace(local.region, "-", "")
 
-  # Mandatory business tags (team standard). The CI checks that repo-name matches the
-  # GitHub repository name.
+  # Mandatory business tags (team standard). repo-name must equal the GitHub repository name
+  # (this repository's CI does not check it).
   mandatory_tags = {
     "team-owner"   = "nube-segura"
     "project-name" = "over-engineered-calculator"
