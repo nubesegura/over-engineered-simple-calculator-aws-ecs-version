@@ -203,3 +203,22 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
         run: python3 scripts/cfn_deploy.py destroy --env dev --mode "$MODE"
+
+      # Read-only. Lists what the destroy left behind (tagged resources plus untagged kinds). Deletes can lag in the
+      # tagging index, so it is retried; tombstones (INACTIVE ECS items, deleted NAT gateways) do not count.
+      - name: Verify nothing is left behind
+        if: ${{ inputs.mode == 'destroy' && steps.owner.outputs.owner != 'none' }}
+        working-directory: .
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set +e
+          python3 scripts/post_destroy_check.py --repo-name "${GITHUB_REPOSITORY#*/}" --env dev --region "$AWS_REGION" --retries 4 --wait 60 | tee "$RUNNER_TEMP/post-destroy.txt"
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### Post-destroy check"
+            echo '```'
+            cat "$RUNNER_TEMP/post-destroy.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
