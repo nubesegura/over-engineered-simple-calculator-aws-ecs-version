@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Security stack (twin of the Terraform unit "security", module modules/security): customer managed
+  KMS key with its alias and the alerts SNS topic with its policy and email subscription.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment tier; always the last segment of every resource name
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+    Description: Functional context shared by every resource of the project (naming convention segment)
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+    Description: Region without hyphens (naming convention segment), for example useast2
+  KmsDeletionWindowDays:
+    Type: Number
+    MinValue: 7
+    MaxValue: 30
+    Description: Waiting period before a scheduled deletion of the key takes effect (30 in prod, KMS-02)
+  AlertEmail:
+    Type: String
+    NoEcho: true
+    MinLength: 3
+    Description: Address that receives the alerts (GitHub secret SUPPORT_EMAIL; confirmed by hand)
+
+Resources:
+  # ---------------------------------------------------------
+  # KMS key (one customer managed key per environment)
+  # ---------------------------------------------------------
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Main CMK of ${Context} (${EnvType})"
+      EnableKeyRotation: true
+      PendingWindowInDays: !Ref KmsDeletionWindowDays
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: KeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:Describe*
+              - kms:PutKeyPolicy
+              - kms:Create*
+              - kms:Update*
+              - kms:Enable*
+              - kms:RevokeGrant
+              - kms:List*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:RetireGrant
+              - kms:RotateKeyOnDemand
+            Resource: "*"
+          - Sid: KeyUsageViaServices
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService:
+                  - !Sub "s3.${AWS::Region}.amazonaws.com"
+                  - !Sub "sns.${AWS::Region}.amazonaws.com"
+                  - !Sub "ecr.${AWS::Region}.amazonaws.com"
+                  - !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                  - !Sub "rds.${AWS::Region}.amazonaws.com"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          - Sid: AwsServiceProducers
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: !Sub "kms-${RegionCode}-${Context}-data-${EnvType}"
+
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/kms-${RegionCode}-${Context}-data-${EnvType}"
+      TargetKeyId: !Ref Key
+
+  # ---------------------------------------------------------
+  # SNS topic for alerts and alarms
+  # ---------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sns-${RegionCode}-${Context}-alerts-${EnvType}"
+      KmsMasterKeyId: !GetAtt Key.Arn
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Id: AlertsTopicPolicy
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*"
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action:
+              - sns:Publish
+              - sns:Subscribe
+            Resource: !Ref AlertsTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # The owner confirms the subscription from the email the first time.
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+Outputs:
+  KmsKeyArn:
+    Description: ARN of the environment KMS key
+    Value: !GetAtt Key.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}:KmsKeyArn"
+  KmsKeyAlias:
+    Description: Alias of the environment KMS key
+    Value: !Ref KeyAlias
+  AlertTopicArn:
+    Description: ARN of the alerts SNS topic
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}:AlertTopicArn"

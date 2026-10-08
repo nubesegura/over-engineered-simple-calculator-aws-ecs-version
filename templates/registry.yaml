@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >-
+  Registry stack (twin of the Terraform unit "registry", module modules/registry): one ECR repository
+  per container image with its lifecycle policy (Terraform aws_ecr_lifecycle_policy is embedded in the
+  repository here). The migration image reuses the history repository.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  ForceDestroyData:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Delete repositories that still hold images on destroy (dev only)
+  ImagesToKeep:
+    Type: Number
+    Default: 5
+    Description: Number of images kept per repository by the lifecycle policy
+
+Conditions:
+  EmptyOnDelete: !Equals [!Ref ForceDestroyData, "true"]
+
+Resources:
+  Fn::ForEach::Repositories:
+    - Svc
+    - [add, sub, mul, div, history, ingest]
+    - Repository${Svc}:
+        Type: AWS::ECR::Repository
+        Properties:
+          RepositoryName: !Sub "ecr-${RegionCode}-${Context}-${Svc}-${EnvType}"
+          ImageTagMutability: IMMUTABLE # ECR-02
+          EmptyOnDelete: !If [EmptyOnDelete, true, false]
+          ImageScanningConfiguration:
+            ScanOnPush: true # ECR-01
+          EncryptionConfiguration: # ECR-04
+            EncryptionType: KMS
+            KmsKey:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+          # Keep the newest images only (ECR-03). Same document as the Terraform jsonencode.
+          LifecyclePolicy:
+            LifecyclePolicyText: !Sub '{"rules":[{"action":{"type":"expire"},"description":"Keep the last ${ImagesToKeep} images","rulePriority":1,"selection":{"countNumber":${ImagesToKeep},"countType":"imageCountMoreThan","tagStatus":"any"}}]}'
+
+Outputs:
+  Fn::ForEach::RepositoryOutputs:
+    - Svc
+    - [add, sub, mul, div, history, ingest]
+    - RepositoryUri${Svc}:
+        Description: Repository URL of the image
+        Value: !GetAtt
+          - !Sub "Repository${Svc}"
+          - RepositoryUri
+        Export:
+          Name: !Sub "${AWS::StackName}:RepositoryUri-${Svc}"
+      RepositoryArn${Svc}:
+        Description: Repository ARN of the image
+        Value: !GetAtt
+          - !Sub "Repository${Svc}"
+          - Arn
+        Export:
+          Name: !Sub "${AWS::StackName}:RepositoryArn-${Svc}"

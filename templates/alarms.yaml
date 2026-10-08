@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >-
+  Alarms stack (twin of the Terraform unit "alarms", module modules/alarms): ECS CPU and target group
+  healthy hosts per service, load balancer and target 5XX, database storage, connections and CPU, and
+  failed invocations of the ingest rule (16 alarms; the scheduler and rotation alarms live in their stacks).
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  AlarmServiceCpuPercent:
+    Type: Number
+  AlarmAlb5xxCount:
+    Type: Number
+  AlarmTarget5xxCount:
+    Type: Number
+  AlarmDbFreeStorageBytes:
+    Type: Number
+  AlarmDbConnections:
+    Type: Number
+  AlarmDbCpuPercent:
+    Type: Number
+
+Resources:
+  Fn::ForEach::ServiceAlarms:
+    - Svc
+    - [add, sub, mul, div, history]
+    # Missing data is notBreaching: a restarting service publishes no datapoints and the healthy hosts
+    # alarm covers that case.
+    - ServiceCpuAlarm${Svc}:
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName: !Sub "alrm-${RegionCode}-${Context}-${Svc}-cpu-${EnvType}"
+          AlarmDescription: !Sub "CPU utilization of the ${Svc} service is above ${AlarmServiceCpuPercent} percent"
+          Namespace: AWS/ECS
+          MetricName: CPUUtilization
+          Statistic: Average
+          Period: 300
+          EvaluationPeriods: 3
+          DatapointsToAlarm: 3
+          Threshold: !Ref AlarmServiceCpuPercent
+          ComparisonOperator: GreaterThanThreshold
+          TreatMissingData: notBreaching
+          Dimensions:
+            - Name: ClusterName
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-cluster-${EnvType}:ClusterName"
+            - Name: ServiceName
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-services-${EnvType}:ServiceName-${Svc}"
+          AlarmActions:
+            - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+      # Missing data is breaching: no datapoint means the target group or the balancer is not reporting.
+      HealthyHostsAlarm${Svc}:
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+          AlarmName: !Sub "alrm-${RegionCode}-${Context}-${Svc}-healthy-hosts-${EnvType}"
+          AlarmDescription: !Sub "The ${Svc} target group has no healthy target"
+          Namespace: AWS/ApplicationELB
+          MetricName: HealthyHostCount
+          Statistic: Minimum
+          Period: 60
+          EvaluationPeriods: 3
+          DatapointsToAlarm: 3
+          Threshold: 1
+          ComparisonOperator: LessThanThreshold
+          TreatMissingData: breaching
+          Dimensions:
+            - Name: TargetGroup
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-edge-${EnvType}:TargetGroupFullName-${Svc}"
+            - Name: LoadBalancer
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-edge-${EnvType}:AlbFullName"
+          AlarmActions:
+            - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  # Missing data is notBreaching on the 5XX alarms: no traffic means no errors.
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-alb-5xx-${EnvType}"
+      AlarmDescription: !Sub "The load balancer itself returned at least ${AlarmAlb5xxCount} 5XX responses in 5 minutes"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmAlb5xxCount
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-edge-${EnvType}:AlbFullName"
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-target-5xx-${EnvType}"
+      AlarmDescription: !Sub "The services returned more than ${AlarmTarget5xxCount} 5XX responses in 5 minutes"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmTarget5xxCount
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-edge-${EnvType}:AlbFullName"
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  # Missing data is breaching on the three database alarms: an instance that stops reporting is a problem.
+  DbFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-db-free-storage-${EnvType}"
+      AlarmDescription: !Sub "The database has less than ${AlarmDbFreeStorageBytes} bytes of free storage"
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmDbFreeStorageBytes
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:InstanceIdentifier"
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  DbConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-db-connections-${EnvType}"
+      AlarmDescription: !Sub "The database has more than ${AlarmDbConnections} connections"
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref AlarmDbConnections
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:InstanceIdentifier"
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-db-cpu-${EnvType}"
+      AlarmDescription: !Sub "Database CPU utilization is above ${AlarmDbCpuPercent} percent"
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: !Ref AlarmDbCpuPercent
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:InstanceIdentifier"
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  # Missing data is notBreaching: the metric exists only when the rule fires.
+  IngestFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-ingest-failed-invocations-${EnvType}"
+      AlarmDescription: EventBridge could not start the ingestion job for an uploaded file
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: RuleName
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-ingestion-${EnvType}:IngestRuleName"
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"

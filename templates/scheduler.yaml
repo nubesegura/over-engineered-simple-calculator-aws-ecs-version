@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  NAT scheduler stack (twin of the Terraform unit "scheduler", module modules/nat-scheduler): function
+  (code in src/scheduler/nat_scheduler, packaged by sam build), its log group, roles, the two
+  EventBridge Scheduler schedules and the error alarm. Terraform also invokes the function at apply
+  (action on) and destroy (action off) through aws_lambda_invocation, which creates no AWS resource:
+  on the CloudFormation path the pipeline makes those two invocations (see templates/README.md).
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  NatOffSchedule:
+    Type: String
+    Description: EventBridge Scheduler cron expression that removes the NAT gateway
+  NatOnSchedule:
+    Type: String
+    Description: EventBridge Scheduler cron expression that creates the NAT gateway
+  NatTimeZone:
+    Type: String
+    Description: IANA time zone of both schedules
+  LogRetentionDays:
+    Type: Number
+  EnableXrayTracing:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Active X-Ray tracing of the function (prod only, LMB-07)
+  FunctionTimeoutSeconds:
+    Type: Number
+    Default: 300
+    Description: Function timeout; it must cover the wait for the NAT gateway to become available
+  # The five mandatory tags (the function copies them to the NAT gateway it creates). The deploy script
+  # fills these from the Tags section of parameters/<env>.json.
+  TagTeamOwner:
+    Type: String
+  TagProjectName:
+    Type: String
+  TagAppName:
+    Type: String
+  TagRepoName:
+    Type: String
+
+Conditions:
+  XrayEnabled: !Equals [!Ref EnableXrayTracing, "true"]
+
+Resources:
+  # Created here so it has retention, the key and tags (Lambda would create it without them).
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Context}/${EnvType}/lambda/nat-scheduler"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+  # ---------------------------------------------------------
+  # Function role: NAT gateway, private default route, tagging and its own logs only
+  # ---------------------------------------------------------
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-nat-fnc-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  FunctionRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-nat-fnc-${EnvType}"
+      RoleName: !Ref FunctionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadNetworkState
+            Effect: Allow
+            Action:
+              - ec2:DescribeNatGateways
+              - ec2:DescribeRouteTables
+              - ec2:DescribeAddresses
+            Resource: "*"
+          - Sid: CreateNatGateway
+            Effect: Allow
+            Action: ec2:CreateNatGateway
+            Resource:
+              - !Sub
+                - "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${SubnetId}"
+                - SubnetId:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:NatPublicSubnetId"
+              - !Sub
+                - "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${AllocationId}"
+                - AllocationId:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:NatEipAllocationId"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:natgateway/*"
+          - Sid: TagNatGatewayOnCreate
+            Effect: Allow
+            Action: ec2:CreateTags
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:natgateway/*"
+            Condition:
+              StringEquals:
+                ec2:CreateAction: CreateNatGateway
+          - Sid: DeleteTaggedNatGateway
+            Effect: Allow
+            Action: ec2:DeleteNatGateway
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:natgateway/*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Name: !Sub "nat-${RegionCode}-${Context}-${EnvType}"
+                aws:ResourceTag/env-type: !Ref EnvType
+                aws:ResourceTag/repo-name: !Ref TagRepoName
+          - Sid: ManagePrivateDefaultRoute
+            Effect: Allow
+            Action:
+              - ec2:CreateRoute
+              - ec2:ReplaceRoute
+              - ec2:DeleteRoute
+            Resource: !Sub
+              - "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${RouteTableId}"
+              - RouteTableId:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:PrivateRouteTableId"
+          - Sid: WriteOwnLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "${FunctionLogGroup.Arn}:*"
+          - !If
+            - XrayEnabled
+            - Sid: XRayTracing
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: "*"
+            - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------
+  # Function (no third-party dependencies: boto3 comes with the runtime)
+  # ---------------------------------------------------------
+  NatSchedulerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: FunctionRolePolicy
+    Properties:
+      FunctionName: !Sub "fnc-${RegionCode}-${Context}-nat-scheduler-${EnvType}"
+      Role: !GetAtt FunctionRole.Arn
+      Runtime: python3.14
+      Architectures: [arm64]
+      Handler: handler.handler
+      Timeout: !Ref FunctionTimeoutSeconds
+      MemorySize: 128
+      CodeUri: ../src/scheduler/nat_scheduler
+      Environment:
+        Variables:
+          PUBLIC_SUBNET_ID:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:NatPublicSubnetId"
+          PRIVATE_ROUTE_TABLE_ID:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:PrivateRouteTableId"
+          EIP_ALLOCATION_ID:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:NatEipAllocationId"
+          NAME_TAG: !Sub "nat-${RegionCode}-${Context}-${EnvType}"
+          # Same string as Terraform jsonencode(default_tags): keys in alphabetical order, no spaces.
+          TAGS_JSON: !Sub '{"app-name":"${TagAppName}","env-type":"${EnvType}","project-name":"${TagProjectName}","repo-name":"${TagRepoName}","team-owner":"${TagTeamOwner}"}'
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref FunctionLogGroup
+      Tracing: !If [XrayEnabled, Active, PassThrough]
+
+  # ---------------------------------------------------------
+  # EventBridge Scheduler: off at night, on in the morning (invoke only this function)
+  # ---------------------------------------------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-nat-scheduler-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default"
+
+  SchedulerRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-nat-scheduler-${EnvType}"
+      RoleName: !Ref SchedulerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeOnlyTheNatScheduler
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt NatSchedulerFunction.Arn
+
+  OffSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: SchedulerRolePolicy
+    Properties:
+      Name: !Sub "evs-${RegionCode}-${Context}-nat-off-${EnvType}"
+      Description: Remove the NAT gateway at night
+      ScheduleExpression: !Ref NatOffSchedule
+      ScheduleExpressionTimezone: !Ref NatTimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt NatSchedulerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"off"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
+  OnSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: SchedulerRolePolicy
+    Properties:
+      Name: !Sub "evs-${RegionCode}-${Context}-nat-on-${EnvType}"
+      Description: Create the NAT gateway and the private default route in the morning
+      ScheduleExpression: !Ref NatOnSchedule
+      ScheduleExpressionTimezone: !Ref NatTimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt NatSchedulerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"on"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
+  # ---------------------------------------------------------
+  # Alarm on function errors
+  # ---------------------------------------------------------
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "alrm-${RegionCode}-${Context}-nat-scheduler-errors-${EnvType}"
+      AlarmDescription: "The NAT scheduler function failed: the NAT gateway and the private default route may be inconsistent"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NatSchedulerFunction
+      AlarmActions:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+Outputs:
+  FunctionName:
+    Description: Name of the NAT scheduler function (invoked with on before anything that needs egress)
+    Value: !Ref NatSchedulerFunction
+  FunctionArn:
+    Value: !GetAtt NatSchedulerFunction.Arn
+  NatNameTag:
+    Description: Name tag of the NAT gateway created by the function
+    Value: !Sub "nat-${RegionCode}-${Context}-${EnvType}"

@@ -6,3 +6,4 @@
 - [0004 Alternating-user credential rotation](0004-alternating-user-rotation.md)
 - [0005 Self-signed certificates between load balancer and tasks](0005-self-signed-target-certificates.md)
 - [0006 Route 53 weights owned by the webpage repository](0006-route-53-weights-owned-by-webpage.md)
+- [0007 Dual IaC, Terraform and CloudFormation](0007-dual-iac-terraform-and-cloudformation.md)

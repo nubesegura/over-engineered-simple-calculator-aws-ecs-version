@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Network stack (twin of the Terraform unit "network", module modules/network): VPC, subnets, route
+  tables, S3 gateway endpoint, NAT Elastic IP, security groups and their rules, and the VPC flow log
+  in prod. The NAT gateway and the private default route are created by the scheduler function.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  VpcCidr:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/16$"
+    Description: CIDR block of the VPC (a /16; subnets are /24 slices of it)
+  EnableFlowLogs:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Create the VPC flow log with its role and log group (prod only, VPC-01)
+  LogRetentionDays:
+    Type: Number
+    Description: Retention of the flow log group in days
+  TaskPort:
+    Type: Number
+    Default: 8443
+    Description: Port where the tasks serve HTTPS (load balancer to services)
+  DatabasePort:
+    Type: Number
+    Default: 5432
+    Description: PostgreSQL port
+
+Conditions:
+  CreateFlowLogs: !Equals [!Ref EnableFlowLogs, "true"]
+
+Resources:
+  # ---------------------------------------------------------
+  # VPC, subnets, internet gateway
+  # ---------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "vpc-${RegionCode}-${Context}-${EnvType}"
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 13, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "snet-${RegionCode}-${Context}-public-a-${EnvType}"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 13, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "snet-${RegionCode}-${Context}-public-b-${EnvType}"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [11, !Cidr [!Ref VpcCidr, 13, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "snet-${RegionCode}-${Context}-private-a-${EnvType}"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [12, !Cidr [!Ref VpcCidr, 13, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "snet-${RegionCode}-${Context}-private-b-${EnvType}"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "igw-${RegionCode}-${Context}-${EnvType}"
+
+  # Terraform sets vpc_id on the gateway; CloudFormation needs a separate attachment (no AWS resource of its own).
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------
+  # Route tables
+  # ---------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "rtb-${RegionCode}-${Context}-public-${EnvType}"
+
+  PublicInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # The private table has NO default route here: the NAT scheduler function creates and deletes it
+  # together with the NAT gateway (CloudFormation does not manage routes it did not declare).
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "rtb-${RegionCode}-${Context}-private-${EnvType}"
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Free gateway endpoint: S3 traffic (image layers, ingestion) does not use the NAT.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      Tags:
+        - Key: Name
+          Value: !Sub "vpce-${RegionCode}-${Context}-s3-${EnvType}"
+
+  # Fixed address of the NAT gateway; the scheduler function attaches it each morning.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "eip-${RegionCode}-${Context}-nat-${EnvType}"
+
+  # ---------------------------------------------------------
+  # Security groups. Rules with a CIDR are embedded so that EC2 does not add its default allow-all
+  # egress rule (Terraform removes it); rules that reference another group are separate resources to
+  # avoid circular dependencies. The database group has no egress in Terraform: CloudFormation needs
+  # at least one embedded egress rule to drop the default one, so it carries the documented loopback
+  # rule (127.0.0.1/32), which allows no traffic out of the instance.
+  # ---------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "sgp-${RegionCode}-${Context}-alb-${EnvType}"
+      GroupDescription: "Load balancer: HTTPS and HTTP from the internet, egress to the tasks only"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTPS from the internet to the load balancer
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: HTTP from the internet to the load balancer (only redirects to HTTPS)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - Description: Load balancer to the token issuer public keys (JWKS) over HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "sgp-${RegionCode}-${Context}-alb-${EnvType}"
+
+  SvcSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "sgp-${RegionCode}-${Context}-svc-${EnvType}"
+      GroupDescription: "HTTP services: task port from the load balancer, egress 443 and database"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: HTTPS egress (ECR, logs, secrets, SNS through the NAT; S3 through the endpoint)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "sgp-${RegionCode}-${Context}-svc-${EnvType}"
+
+  JobSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "sgp-${RegionCode}-${Context}-job-${EnvType}"
+      GroupDescription: "Jobs (ingest, migrate, rotation): no ingress, egress 443 and database"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: HTTPS egress (ECR, logs, secrets, SNS through the NAT; S3 through the endpoint)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "sgp-${RegionCode}-${Context}-job-${EnvType}"
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "sgp-${RegionCode}-${Context}-db-${EnvType}"
+      GroupDescription: "PostgreSQL: database port only from the services and jobs groups"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: Placeholder that removes the default egress rule (loopback only, no traffic)
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: !Sub "sgp-${RegionCode}-${Context}-db-${EnvType}"
+
+  AlbToSvcEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      Description: Load balancer to the services on the task port
+      IpProtocol: tcp
+      FromPort: !Ref TaskPort
+      ToPort: !Ref TaskPort
+      DestinationSecurityGroupId: !Ref SvcSecurityGroup
+
+  SvcFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SvcSecurityGroup
+      Description: Task port from the load balancer
+      IpProtocol: tcp
+      FromPort: !Ref TaskPort
+      ToPort: !Ref TaskPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  SvcToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref SvcSecurityGroup
+      Description: Services to the database
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  JobToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref JobSecurityGroup
+      Description: Jobs to the database
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  DbFromSvcIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL from the services
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      SourceSecurityGroupId: !Ref SvcSecurityGroup
+
+  DbFromJobIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL from the jobs
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      SourceSecurityGroupId: !Ref JobSecurityGroup
+
+  # ---------------------------------------------------------
+  # VPC flow logs (prod only, VPC-01)
+  # ---------------------------------------------------------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateFlowLogs
+    Properties:
+      LogGroupName: !Sub "/${Context}/${EnvType}/vpc-flow"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: CreateFlowLogs
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-flowlog-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  FlowLogRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: CreateFlowLogs
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-flowlog-${EnvType}"
+      RoleName: !Ref FlowLogRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt FlowLogGroup.Arn
+              - !Sub "${FlowLogGroup.Arn}:*"
+
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateFlowLogs
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogDestination: !GetAtt FlowLogGroup.Arn
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "flog-${RegionCode}-${Context}-${EnvType}"
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "${AWS::StackName}:VpcId"
+  VpcCidr:
+    Value: !GetAtt Vpc.CidrBlock
+  DefaultSecurityGroupId:
+    Description: Default security group of the VPC (locked by the pipeline, see templates/README.md)
+    Value: !GetAtt Vpc.DefaultSecurityGroup
+  PublicSubnetIds:
+    Description: Public subnet IDs (AZ a first)
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export:
+      Name: !Sub "${AWS::StackName}:PublicSubnetIds"
+  PrivateSubnetIds:
+    Description: Private subnet IDs (AZ a first)
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export:
+      Name: !Sub "${AWS::StackName}:PrivateSubnetIds"
+  NatPublicSubnetId:
+    Description: Public subnet where the scheduler creates the NAT gateway (AZ a)
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub "${AWS::StackName}:NatPublicSubnetId"
+  PublicRouteTableId:
+    Value: !Ref PublicRouteTable
+  PrivateRouteTableId:
+    Description: Private route table (the scheduler owns its default route)
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub "${AWS::StackName}:PrivateRouteTableId"
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}:AlbSecurityGroupId"
+  SvcSecurityGroupId:
+    Value: !Ref SvcSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}:SvcSecurityGroupId"
+  JobSecurityGroupId:
+    Value: !Ref JobSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}:JobSecurityGroupId"
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}:DbSecurityGroupId"
+  NatEipAllocationId:
+    Description: Allocation ID of the Elastic IP for the NAT gateway
+    Value: !GetAtt NatEip.AllocationId
+    Export:
+      Name: !Sub "${AWS::StackName}:NatEipAllocationId"

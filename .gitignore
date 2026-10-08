@@ -32,3 +32,6 @@ environments/*/secrets.yml
 
 # Lambda packages built by scripts/package_rotation.py
 .build/
+
+# SAM build output
+.aws-sam/

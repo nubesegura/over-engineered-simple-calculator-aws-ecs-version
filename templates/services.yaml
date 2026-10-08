@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >-
+  Services stack (twin of the Terraform unit "services", module modules/service): for each HTTP service
+  (add, sub, mul, div, history) a log group, an execution role and a task role with their inline
+  policies, a Fargate task definition and an ECS service behind its target group.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  LogRetentionDays:
+    Type: Number
+  TaskCpu:
+    Type: Number
+  TaskMemory:
+    Type: Number
+  ContainerPort:
+    Type: Number
+    Default: 8443
+  HealthCheckGracePeriodSeconds:
+    Type: Number
+    Default: 60
+  ImageTag:
+    Type: String
+    MinLength: 1
+    AllowedPattern: "^(?!unset-)[A-Za-z0-9._-]+$"
+    Description: Image tag (the commit SHA) of every task definition
+  WebOrigin:
+    Type: String
+    Description: Origin of the web page (CORS)
+
+Resources:
+  Fn::ForEach::Services:
+    - Svc
+    - [add, sub, mul, div, history]
+    - LogGroup${Svc}:
+        Type: AWS::Logs::LogGroup
+        Properties:
+          LogGroupName: !Sub "/${Context}/${EnvType}/ecs/${Svc}"
+          RetentionInDays: !Ref LogRetentionDays
+          KmsKeyId:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+      # Execution role: pulls its image and writes its logs, nothing else.
+      ExecRole${Svc}:
+        Type: AWS::IAM::Role
+        Properties:
+          RoleName: !Sub "iamr-${RegionCode}-${Context}-${Svc}-exec-${EnvType}"
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: ecs-tasks.amazonaws.com
+                Action: sts:AssumeRole
+                Condition:
+                  StringEquals:
+                    aws:SourceAccount: !Ref AWS::AccountId
+
+      ExecRolePolicy${Svc}:
+        Type: AWS::IAM::RolePolicy
+        Properties:
+          PolicyName: !Sub "iamp-${RegionCode}-${Context}-${Svc}-exec-${EnvType}"
+          RoleName: !Ref
+            Fn::Sub: "ExecRole${Svc}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PullOwnImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-registry-${EnvType}:RepositoryArn-${Svc}"
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub
+                  - "${LogGroupArn}:*"
+                  - LogGroupArn: !GetAtt
+                      - !Sub "LogGroup${Svc}"
+                      - Arn
+
+      # Task role: application secret, the key and the alerts topic. No master secret, no S3.
+      TaskRole${Svc}:
+        Type: AWS::IAM::Role
+        Properties:
+          RoleName: !Sub "iamr-${RegionCode}-${Context}-${Svc}-task-${EnvType}"
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service: ecs-tasks.amazonaws.com
+                Action: sts:AssumeRole
+                Condition:
+                  StringEquals:
+                    aws:SourceAccount: !Ref AWS::AccountId
+
+      TaskRolePolicy${Svc}:
+        Type: AWS::IAM::RolePolicy
+        Properties:
+          PolicyName: !Sub "iamp-${RegionCode}-${Context}-${Svc}-task-${EnvType}"
+          RoleName: !Ref
+            Fn::Sub: "TaskRole${Svc}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadApplicationSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:AppSecretArn"
+              - Sid: UseEnvironmentKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      - !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                      - !Sub "sns.${AWS::Region}.amazonaws.com"
+              - Sid: PublishAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+      TaskDefinition${Svc}:
+        Type: AWS::ECS::TaskDefinition
+        DependsOn:
+          - !Sub "ExecRolePolicy${Svc}"
+          - !Sub "TaskRolePolicy${Svc}"
+        Properties:
+          Family: !Sub "ecst-${RegionCode}-${Context}-${Svc}-${EnvType}"
+          RequiresCompatibilities: [FARGATE]
+          NetworkMode: awsvpc
+          Cpu: !Ref TaskCpu
+          Memory: !Ref TaskMemory
+          ExecutionRoleArn: !GetAtt
+            - !Sub "ExecRole${Svc}"
+            - Arn
+          TaskRoleArn: !GetAtt
+            - !Sub "TaskRole${Svc}"
+            - Arn
+          RuntimePlatform:
+            OperatingSystemFamily: LINUX
+            CpuArchitecture: ARM64
+          # Ephemeral scratch space (TLS material): the only writable path.
+          Volumes:
+            - Name: tmp
+          ContainerDefinitions:
+            - Name: !Ref Svc
+              Image: !Sub
+                - "${RepositoryUri}:${ImageTag}"
+                - RepositoryUri:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-registry-${EnvType}:RepositoryUri-${Svc}"
+              Essential: true
+              Privileged: false
+              ReadonlyRootFilesystem: true
+              PortMappings:
+                - ContainerPort: !Ref ContainerPort
+                  Protocol: tcp
+              MountPoints:
+                - SourceVolume: tmp
+                  ContainerPath: /tmp
+                  ReadOnly: false
+              # Only references and addresses: the secret value is read by the task at run time.
+              Environment:
+                - Name: ENVIRONMENT
+                  Value: !Ref EnvType
+                - Name: SERVICE_NAME
+                  Value: !Ref Svc
+                - Name: APP_SECRET_ARN
+                  Value:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:AppSecretArn"
+                - Name: DB_HOST
+                  Value:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:EndpointAddress"
+                - Name: DB_PORT
+                  Value:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:Port"
+                - Name: DB_NAME
+                  Value:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:DbName"
+                - Name: ALERT_TOPIC_ARN
+                  Value:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+                - Name: CORS_ALLOWED_ORIGIN
+                  Value: !Ref WebOrigin
+                # /dev/shm is writable with a read-only root filesystem; the TLS key never touches a disk.
+                - Name: TLS_DIRECTORY
+                  Value: /dev/shm
+              LogConfiguration:
+                LogDriver: awslogs
+                Options:
+                  awslogs-group: !Ref
+                    Fn::Sub: "LogGroup${Svc}"
+                  awslogs-region: !Ref AWS::Region
+                  awslogs-stream-prefix: !Ref Svc
+
+      Service${Svc}:
+        Type: AWS::ECS::Service
+        Properties:
+          ServiceName: !Sub "ecss-${RegionCode}-${Context}-${Svc}-${EnvType}"
+          Cluster:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-cluster-${EnvType}:ClusterArn"
+          TaskDefinition: !Ref
+            Fn::Sub: "TaskDefinition${Svc}"
+          DesiredCount: 1
+          HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriodSeconds
+          PropagateTags: SERVICE
+          CapacityProviderStrategy:
+            - CapacityProvider: FARGATE
+              Weight: 1
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              Subnets: !Split
+                - ","
+                - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:PrivateSubnetIds"
+              SecurityGroups:
+                - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:SvcSecurityGroupId"
+              AssignPublicIp: DISABLED
+          LoadBalancers:
+            - TargetGroupArn:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-edge-${EnvType}:TargetGroupArn-${Svc}"
+              ContainerName: !Ref Svc
+              ContainerPort: !Ref ContainerPort
+          DeploymentConfiguration:
+            DeploymentCircuitBreaker:
+              Enable: true
+              Rollback: true
+
+Outputs:
+  Fn::ForEach::ServiceOutputs:
+    - Svc
+    - [add, sub, mul, div, history]
+    - ServiceName${Svc}:
+        Value: !GetAtt
+          - !Sub "Service${Svc}"
+          - Name
+        Export:
+          Name: !Sub "${AWS::StackName}:ServiceName-${Svc}"

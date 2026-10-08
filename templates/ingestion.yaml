@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Ingestion stack (twin of the Terraform unit "ingestion", module modules/ingestion): ingest task
+  definition, its roles and log group, the S3 trigger rule with its ECS target and role, and the
+  failed-task alert rule. Terraform aws_cloudwatch_event_target resources are the Targets of each rule.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  LogRetentionDays:
+    Type: Number
+  TaskCpu:
+    Type: Number
+  TaskMemory:
+    Type: Number
+  ImageTag:
+    Type: String
+    MinLength: 1
+    AllowedPattern: "^(?!unset-)[A-Za-z0-9._-]+$"
+    Description: Image tag (the commit SHA) of the task definition
+  WebOrigin:
+    Type: String
+    Description: Origin of the web page (CORS); required by the shared settings, unused by the job
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Context}/${EnvType}/ecs/ingest"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+  ExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-ingest-exec-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ExecRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-ingest-exec-${EnvType}"
+      RoleName: !Ref ExecRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RegistryLogin
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: PullIngestImage
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-registry-${EnvType}:RepositoryArn-ingest"
+          - Sid: WriteIngestLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "${LogGroup.Arn}:*"
+
+  # Task role: application secret, the bucket prefixes it needs, the key and the topic. No ListBucket.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-ingest-task-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  TaskRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-ingest-task-${EnvType}"
+      RoleName: !Ref TaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadApplicationSecret
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:AppSecretArn"
+          - Sid: UseEnvironmentKey
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                  - !Sub "s3.${AWS::Region}.amazonaws.com"
+                  - !Sub "sns.${AWS::Region}.amazonaws.com"
+          - Sid: ReadAndRemoveIncoming
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Sub
+              - "${BucketArn}/incoming/*"
+              - BucketArn:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:IngestBucketArn"
+          - Sid: WriteResults
+            Effect: Allow
+            Action: s3:PutObject
+            Resource:
+              - !Sub
+                - "${BucketArn}/reports/*"
+                - BucketArn:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:IngestBucketArn"
+              - !Sub
+                - "${BucketArn}/processed/*"
+                - BucketArn:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:IngestBucketArn"
+              - !Sub
+                - "${BucketArn}/rejected/*"
+                - BucketArn:
+                    Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:IngestBucketArn"
+          - Sid: PublishAlerts
+            Effect: Allow
+            Action: sns:Publish
+            Resource:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+
+  # INGEST_BUCKET and INGEST_KEY are not set here: the rule target injects them on every run.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - ExecRolePolicy
+      - TaskRolePolicy
+    Properties:
+      Family: !Sub "ecst-${RegionCode}-${Context}-ingest-${EnvType}"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: ARM64
+      Volumes:
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: ingest
+          Image: !Sub
+            - "${RepositoryUri}:${ImageTag}"
+            - RepositoryUri:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-registry-${EnvType}:RepositoryUri-ingest"
+          Essential: true
+          Privileged: false
+          ReadonlyRootFilesystem: true
+          MountPoints:
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref EnvType
+            - Name: SERVICE_NAME
+              Value: ingest
+            - Name: APP_SECRET_ARN
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:AppSecretArn"
+            - Name: DB_HOST
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:EndpointAddress"
+            - Name: DB_PORT
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:Port"
+            - Name: DB_NAME
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:DbName"
+            - Name: ALERT_TOPIC_ARN
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+            - Name: CORS_ALLOWED_ORIGIN
+              Value: !Ref WebOrigin
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ingest
+
+  # Events role: starts the job and passes its two roles, nothing else.
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-ingest-events-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  EventsRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-ingest-events-${EnvType}"
+      RoleName: !Ref EventsRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RunIngestTask
+            Effect: Allow
+            Action: ecs:RunTask
+            Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/ecst-${RegionCode}-${Context}-ingest-${EnvType}:*"
+            Condition:
+              ArnEquals:
+                ecs:cluster:
+                  Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-cluster-${EnvType}:ClusterArn"
+          - Sid: PassIngestRoles
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !GetAtt TaskRole.Arn
+              - !GetAtt ExecRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+
+  # Rule 1: a CSV created under incoming/ starts one job run.
+  IngestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "evr-${RegionCode}-${Context}-ingest-${EnvType}"
+      Description: Starts the ingestion job when a CSV file arrives under incoming/
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name:
+              - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:IngestBucketName"
+          object:
+            key:
+              - wildcard: incoming/*.csv
+      Targets:
+        - Id: ingest-task
+          Arn:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-cluster-${EnvType}:ClusterArn"
+          RoleArn: !GetAtt EventsRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref TaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets: !Split
+                  - ","
+                  - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:PrivateSubnetIds"
+                SecurityGroups:
+                  - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:JobSecurityGroupId"
+                AssignPublicIp: DISABLED
+          InputTransformer:
+            InputPathsMap:
+              bucket: $.detail.bucket.name
+              key: $.detail.object.key
+            InputTemplate: '{"containerOverrides":[{"name":"ingest","environment":[{"name":"INGEST_BUCKET","value":<bucket>},{"name":"INGEST_KEY","value":<key>}]}]}'
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+
+  # Rule 2: any task of this cluster that stops with a non-zero exit code or never starts alerts.
+  TaskFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "evr-${RegionCode}-${Context}-task-failed-${EnvType}"
+      Description: Alerts when a task of the cluster stops with a non-zero exit code or fails to start
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn:
+            - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-cluster-${EnvType}:ClusterArn"
+          lastStatus: [STOPPED]
+          $or:
+            - containers:
+                exitCode:
+                  - anything-but: 0
+            - stopCode: [TaskFailedToStart]
+      Targets:
+        - Id: alerts-topic
+          Arn:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:AlertTopicArn"
+          InputTransformer:
+            InputPathsMap:
+              task: $.detail.taskArn
+              group: $.detail.group
+              reason: $.detail.stoppedReason
+              time: $.time
+            InputTemplate: '"An ECS task failed (non-zero exit code or it never started). Group: <group>. Task: <task>. Reason: <reason>. Time: <time>. See the task logs in CloudWatch."'
+
+Outputs:
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+  ExecRoleArn:
+    Value: !GetAtt ExecRole.Arn
+  LogGroupName:
+    Value: !Ref LogGroup
+  IngestRuleArn:
+    Value: !GetAtt IngestRule.Arn
+  IngestRuleName:
+    Value: !Ref IngestRule
+    Export:
+      Name: !Sub "${AWS::StackName}:IngestRuleName"
+  TaskFailedRuleArn:
+    Value: !GetAtt TaskFailedRule.Arn

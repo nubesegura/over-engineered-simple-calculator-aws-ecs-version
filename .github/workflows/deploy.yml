@@ -5,9 +5,15 @@ name: Deploy (reusable)
 # environment of the same name provides the secrets, the variables and, for prod, the manual
 # approval gate (required reviewers: the owner configures it in the GitHub environment).
 #
-# Order: validate -> OIDC role and account check -> phase 1 (security, network, scheduler,
-# registry, storage, database, rotation, cluster) -> NAT on -> build and push seven images
-# -> migration task -> phase 2 (edge, services, ingestion, alarms) -> smoke test.
+# Order: validate -> OIDC role and account check -> owner guard -> phase 1 (security, network,
+# scheduler, registry, storage, database, rotation, cluster) -> NAT on -> build and push seven
+# images -> migration task -> phase 2 (edge, services, ingestion, alarms) -> smoke test.
+#
+# IaC switch: the GitHub variable IAC_TOOL selects the tool that builds the environment, terraform
+# (default when the variable is unset: Terragrunt units under environments/) or cloudformation (SAM and
+# CloudFormation stacks under templates/, same resources and names, same order and non-IaC steps). The
+# owner guard (scripts/iac_owner_guard.py) stops the job when the environment is owned by the other
+# tool. See templates/README.md and docs/adr/0007-dual-iac-terraform-and-cloudformation.md.
 on:
   workflow_call:
     inputs:
@@ -24,6 +30,8 @@ env:
   # Same versions as ci.yml.
   TERRAFORM_VERSION: "1.16.2"
   TERRAGRUNT_VERSION: "1.1.5"
+  # CloudFormation path only (same version as ci.yml).
+  SAM_CLI_VERSION: "1.158.0"
 
 jobs:
   deploy:
@@ -46,9 +54,21 @@ jobs:
       WAF_ACL_ARN: ${{ vars.WAF_ACL_ARN }}
       TG_NON_INTERACTIVE: "true"
       TG_BACKEND_BOOTSTRAP: "true" # the state bucket is created by Terragrunt on first use
+      # IaC switch: terraform (default) or cloudformation. Only these two values are accepted.
+      IAC_TOOL: ${{ vars.IAC_TOOL || 'terraform' }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate IAC_TOOL
+        run: |
+          case "$IAC_TOOL" in
+            terraform | cloudformation) echo "IaC tool: $IAC_TOOL" ;;
+            *)
+              echo "::error::Variable IAC_TOOL must be 'terraform' or 'cloudformation' (got '$IAC_TOOL')"
+              exit 1
+              ;;
+          esac
 
       # Each environment is a different AWS account, and the branch decides which one:
       # develop -> dev, main -> prod. A run from any other branch must never assume a role.
@@ -125,13 +145,23 @@ jobs:
             exit 1
           fi
 
+      # One IaC tool per environment: stops (fail closed) unless the environment is free or already
+      # owned by IAC_TOOL. Read-only: describe-stacks and the Terraform state objects (counted, never printed).
+      - name: Owner guard (one IaC tool per environment)
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: python3 scripts/iac_owner_guard.py check --tool "$IAC_TOOL" --env "$TARGET"
+
       - name: Setup Terraform
+        if: env.IAC_TOOL == 'terraform'
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
       - name: Install Terragrunt (checksum verified)
+        if: env.IAC_TOOL == 'terraform'
         run: |
           set -euo pipefail
           base="https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}"
@@ -143,12 +173,24 @@ jobs:
           install -m 0755 terragrunt_linux_amd64 "$HOME/.local/bin/terragrunt"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # CloudFormation path: Python for sam build (runtime python3.14 of both functions) and the SAM CLI.
+      - name: Setup Python (CloudFormation path)
+        if: env.IAC_TOOL == 'cloudformation'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14"
+
+      - name: Install SAM CLI (CloudFormation path)
+        if: env.IAC_TOOL == 'cloudformation'
+        run: python -m pip install --disable-pip-version-check "aws-sam-cli==${SAM_CLI_VERSION}"
+
       # The commit SHA is the image tag of every image and of the migration task definition.
       - name: Set image tag
         run: echo "IMAGE_TAG=$GITHUB_SHA" >> "$GITHUB_ENV"
 
       # Terragrunt orders the selected units by their dependencies.
       - name: Phase 1 apply (foundation, data and cluster)
+        if: env.IAC_TOOL == 'terraform'
         run: |
           terragrunt run --all \
             --filter './security' --filter './network' --filter './scheduler' \
@@ -156,12 +198,45 @@ jobs:
             --filter './rotation' --filter './cluster' \
             apply
 
+      # Same units as stacks, in the order of templates/stacks.json; each change set is checked by the
+      # change set guard (no Remove, no replacement except task definitions) before it is executed.
+      - name: Phase 1 deploy (CloudFormation)
+        if: env.IAC_TOOL == 'cloudformation'
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: python scripts/cfn_deploy.py deploy --env "$TARGET" --phase 1
+
       # The private subnets have no internet route until the NAT exists (it is removed every
       # night). Image pulls, the migration and the services need it from here on.
       - name: Ensure egress (NAT on)
+        if: env.IAC_TOOL == 'terraform'
         run: |
           set -euo pipefail
           FUNCTION_NAME=$(terragrunt --working-dir scheduler output -raw function_name)
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --payload '{"action":"on"}' \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 900 \
+            --query FunctionError --output text \
+            "$RUNNER_TEMP/scheduler-response.json" > "$RUNNER_TEMP/scheduler-error.txt"
+          ERROR=$(cat "$RUNNER_TEMP/scheduler-error.txt")
+          if [ "$ERROR" != "None" ]; then
+            echo "::error::The scheduler function returned an error ($ERROR) when turning the NAT on"
+            exit 1
+          fi
+          echo "NAT scheduler invoked with action 'on'"
+
+      # CloudFormation path: also replaces the apply-time invocation of Terraform (aws_lambda_invocation).
+      - name: Ensure egress (NAT on, CloudFormation)
+        if: env.IAC_TOOL == 'cloudformation'
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          FUNCTION_NAME=$(python scripts/cfn_deploy.py output --env "$TARGET" --unit scheduler --key FunctionName)
           aws lambda invoke \
             --function-name "$FUNCTION_NAME" \
             --payload '{"action":"on"}' \
@@ -189,6 +264,7 @@ jobs:
       # The seventh (SERVICE=migrate) goes to the history repository as migrate-<sha>, the tag the
       # cluster unit gives the migration task.
       - name: Build and push images
+        if: env.IAC_TOOL == 'terraform'
         working-directory: .
         env:
           TARGET: ${{ inputs.environment }}
@@ -228,8 +304,53 @@ jobs:
             echo "::endgroup::"
           done
 
+      # Same build as above; the repository URLs come from the registry stack outputs.
+      - name: Build and push images (CloudFormation)
+        if: env.IAC_TOOL == 'cloudformation'
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          REGISTRY_STACK=$(jq -r --arg env "$TARGET" '.environments[$env][] | select(.unit == "registry") | .stack' templates/stacks.json)
+          REPOSITORY_URLS=$(aws cloudformation describe-stacks --stack-name "$REGISTRY_STACK" --query "Stacks[0].Outputs" --output json \
+            | jq 'map(select(.OutputKey | startswith("RepositoryUri"))) | map({key: (.OutputKey | sub("^RepositoryUri"; "")), value: .OutputValue}) | from_entries')
+          REGISTRY=$(echo "$REPOSITORY_URLS" | jq -r '.history | split("/")[0]')
+          echo "::add-mask::$REGISTRY"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY" > /dev/null
+
+          # key (registry output) : SERVICE build argument : tag prefix
+          for entry in add:calc-add: sub:calc-sub: mul:calc-mul: div:calc-div: history:history: ingest:ingest: history:migrate:migrate-; do
+            key="${entry%%:*}"
+            rest="${entry#*:}"
+            service="${rest%%:*}"
+            prefix="${rest#*:}"
+            tag="$prefix$IMAGE_TAG"
+            url=$(echo "$REPOSITORY_URLS" | jq -r --arg key "$key" '.[$key]')
+            repository="${url#*/}"
+            if aws ecr describe-images --repository-name "$repository" \
+                 --image-ids "imageTag=$tag" > /dev/null 2> "$RUNNER_TEMP/describe.err"; then
+              echo "Image $repository:$tag already exists; push skipped"
+              continue
+            fi
+            if ! grep -q "ImageNotFoundException" "$RUNNER_TEMP/describe.err"; then
+              echo "::error::Could not check the image tag in repository $repository"
+              exit 1
+            fi
+            echo "::group::Build and push $repository:$tag"
+            docker buildx build \
+              --platform linux/arm64 \
+              --build-arg "SERVICE=$service" \
+              --provenance=false --sbom=false \
+              --tag "$url:$tag" \
+              --push \
+              src/backend
+            echo "::endgroup::"
+          done
+
       # Database schema migration and application login password, as a one-off Fargate task.
       - name: Run the migration task
+        if: env.IAC_TOOL == 'terraform'
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -263,12 +384,60 @@ jobs:
           fi
           echo "Migration task finished with exit code 0"
 
+      # Same task run as above; names come from the cluster and network stack outputs.
+      - name: Run the migration task (CloudFormation)
+        if: env.IAC_TOOL == 'cloudformation'
+        timeout-minutes: 20
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          out() { python scripts/cfn_deploy.py output --env "$TARGET" --unit "$1" --key "$2"; }
+          CLUSTER=$(out cluster ClusterName)
+          FAMILY=$(out cluster MigrateTaskDefinitionFamily)
+          SUBNETS=$(out network PrivateSubnetIds)
+          SECURITY_GROUP=$(out network JobSecurityGroupId)
+          LOG_GROUP=$(out cluster MigrateLogGroupName)
+          echo "Migration task logs: CloudWatch log group $LOG_GROUP"
+
+          RUN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$FAMILY" \
+            --launch-type FARGATE \
+            --count 1 \
+            --started-by "gha-$GITHUB_RUN_ID" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}")
+          FAILURES=$(echo "$RUN" | jq -r '.failures | length')
+          if [ "$FAILURES" != "0" ]; then
+            echo "::error::The migration task could not be started: $(echo "$RUN" | jq -c '.failures')"
+            exit 1
+          fi
+          TASK_ARN=$(echo "$RUN" | jq -r '.tasks[0].taskArn')
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+          DESCRIPTION=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN")
+          EXIT_CODE=$(echo "$DESCRIPTION" | jq -r '.tasks[0].containers[0].exitCode // "none"')
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::The migration task finished with exit code '$EXIT_CODE' (stop reason: $(echo "$DESCRIPTION" | jq -r '.tasks[0].stoppedReason // "unknown"')); read the log group $LOG_GROUP"
+            exit 1
+          fi
+          echo "Migration task finished with exit code 0"
+
       - name: Phase 2 apply (edge, services, ingestion, alarms)
+        if: env.IAC_TOOL == 'terraform'
         run: |
           terragrunt run --all \
             --filter './edge' --filter './services' \
             --filter './ingestion' --filter './alarms' \
             apply
+
+      - name: Phase 2 deploy (CloudFormation)
+        if: env.IAC_TOOL == 'cloudformation'
+        working-directory: .
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: python scripts/cfn_deploy.py deploy --env "$TARGET" --phase 2
 
       # The API host name is api. + the host of web_origin (the web page origin of env.hcl).
       # Its DNS record is owned by the webpage repository and may point to another backend, so
@@ -276,15 +445,26 @@ jobs:
       # certificate check and the Host header (curl --connect-to).
       - name: Smoke test (through the load balancer)
         timeout-minutes: 10
+        env:
+          TARGET: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          ORIGIN=$(sed -n 's/^[[:space:]]*web_origin[[:space:]]*=[[:space:]]*"\(https:\/\/[^"]*\)".*/\1/p' env.hcl)
+          # The same test for both IaC tools; only the source of the origin and of the balancer name differs.
+          if [ "$IAC_TOOL" = "terraform" ]; then
+            ORIGIN=$(sed -n 's/^[[:space:]]*web_origin[[:space:]]*=[[:space:]]*"\(https:\/\/[^"]*\)".*/\1/p' env.hcl)
+          else
+            ORIGIN=$(jq -r '.Parameters.WebOrigin // empty' "$GITHUB_WORKSPACE/parameters/$TARGET.json")
+          fi
           if [ -z "$ORIGIN" ]; then
-            echo "::error::web_origin not found in env.hcl"
+            echo "::error::web_origin not found in env.hcl (or WebOrigin in parameters/<env>.json)"
             exit 1
           fi
           API_HOST="api.${ORIGIN#https://}"
-          ALB_DNS=$(terragrunt --working-dir edge output -raw alb_dns_name)
+          if [ "$IAC_TOOL" = "terraform" ]; then
+            ALB_DNS=$(terragrunt --working-dir edge output -raw alb_dns_name)
+          else
+            ALB_DNS=$(cd "$GITHUB_WORKSPACE" && python scripts/cfn_deploy.py output --env "$TARGET" --unit edge --key AlbDnsName)
+          fi
           URL="https://$API_HOST/api/v1/add"
 
           # Retries cover the registration of the targets of the first deployment.

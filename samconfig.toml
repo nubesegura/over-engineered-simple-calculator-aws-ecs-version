@@ -1,0 +1,45 @@
+# SAM CLI configuration of the IAC_TOOL=cloudformation path. One section per environment, same keys.
+# The pipeline calls `sam build` and `sam package` through scripts/cfn_deploy.py (stack names, templates,
+# parameters and tags come from templates/stacks.json and parameters/<env>.json, never from here), then
+# deploys each stack with a change set guarded against deletions and replacements.
+#
+# resolve_s3 = true makes SAM create and use its own managed stack (aws-sam-cli-managed-default) and
+# artifact bucket in the account: they are outside the naming convention and the mandatory tags, and they
+# stay after a teardown. Owner decision recorded in the parity report and in templates/README.md.
+version = 0.1
+
+[dev.global.parameters]
+region = "us-east-2"
+
+[dev.build.parameters]
+cached = false
+parallel = false
+
+[dev.package.parameters]
+resolve_s3 = true
+s3_prefix = "over-engineered-simple-calculator-aws-ecs-version/dev"
+
+[dev.deploy.parameters]
+resolve_s3 = true
+s3_prefix = "over-engineered-simple-calculator-aws-ecs-version/dev"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+fail_on_empty_changeset = false
+
+[prod.global.parameters]
+region = "us-east-2"
+
+[prod.build.parameters]
+cached = false
+parallel = false
+
+[prod.package.parameters]
+resolve_s3 = true
+s3_prefix = "over-engineered-simple-calculator-aws-ecs-version/prod"
+
+[prod.deploy.parameters]
+resolve_s3 = true
+s3_prefix = "over-engineered-simple-calculator-aws-ecs-version/prod"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+fail_on_empty_changeset = false

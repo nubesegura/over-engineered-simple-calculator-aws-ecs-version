@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cluster stack (twin of the Terraform unit "cluster", module modules/cluster): ECS cluster, the migrate
+  task (log group, roles, task definition) and the resource policy of the RDS-managed master secret.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  EnableContainerInsights:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Container Insights on the cluster (prod only, ECS-05)
+  LogRetentionDays:
+    Type: Number
+  TaskCpu:
+    Type: Number
+  TaskMemory:
+    Type: Number
+  ImageTag:
+    Type: String
+    MinLength: 1
+    AllowedPattern: "^(?!unset-)[A-Za-z0-9._-]+$"
+    Description: Image tag (the commit SHA); the migrate image is pushed to the history repository as migrate-<tag>
+
+Conditions:
+  InsightsEnabled: !Equals [!Ref EnableContainerInsights, "true"]
+
+Resources:
+  # ---------------------------------------------------------
+  # Cluster: Fargate only, Container Insights in prod
+  # ---------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "ecsc-${RegionCode}-${Context}-${EnvType}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [InsightsEnabled, enabled, disabled]
+
+  MigrateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${Context}/${EnvType}/ecs/migrate"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+  # Execution role: pulls the image and writes the task logs, nothing else.
+  MigrateExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-migrate-exec-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  MigrateExecRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-migrate-exec-${EnvType}"
+      RoleName: !Ref MigrateExecRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RegistryLogin
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: PullMigrationImage
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-registry-${EnvType}:RepositoryArn-history"
+          - Sid: WriteTaskLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "${MigrateLogGroup.Arn}:*"
+
+  # Task role: reads the master secret and the application secret, with the key.
+  MigrateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "iamr-${RegionCode}-${Context}-migrate-task-${EnvType}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  MigrateTaskRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: !Sub "iamp-${RegionCode}-${Context}-migrate-task-${EnvType}"
+      RoleName: !Ref MigrateTaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadMasterAndApplicationSecrets
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:MasterSecretArn"
+              - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:AppSecretArn"
+          - Sid: DecryptSecretsWithEnvironmentKey
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource:
+              Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+
+  # The command is the image default unless run-task overrides it. No secret value is set here.
+  MigrateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - MigrateExecRolePolicy
+      - MigrateTaskRolePolicy
+    Properties:
+      Family: !Sub "ecst-${RegionCode}-${Context}-migrate-${EnvType}"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt MigrateExecRole.Arn
+      TaskRoleArn: !GetAtt MigrateTaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: ARM64
+      Volumes:
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: migrate
+          Image: !Sub
+            - "${RepositoryUri}:migrate-${ImageTag}"
+            - RepositoryUri:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-registry-${EnvType}:RepositoryUri-history"
+          Essential: true
+          Privileged: false
+          ReadonlyRootFilesystem: true
+          MountPoints:
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+          Environment:
+            - Name: MASTER_SECRET_ARN
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:MasterSecretArn"
+            - Name: APP_SECRET_ARN
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:AppSecretArn"
+            - Name: DB_HOST
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:EndpointAddress"
+            - Name: DB_NAME
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:DbName"
+            - Name: DB_PORT
+              Value:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:Port"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref MigrateLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: migrate
+
+  # ---------------------------------------------------------
+  # Resource policy of the RDS-managed master secret (here because this stack knows the migrate role and
+  # the rotation stack already exists: database -> rotation -> cluster).
+  # ---------------------------------------------------------
+  MasterSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-database-${EnvType}:MasterSecretArn"
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: secretsmanager:*
+            Resource: "*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: DenyReadExceptMigrateRotationAndAdmins
+            Effect: Deny
+            Principal: "*"
+            Action: secretsmanager:GetSecretValue
+            Resource: "*"
+            Condition:
+              StringNotLike:
+                aws:PrincipalArn:
+                  - !GetAtt MigrateTaskRole.Arn
+                  - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-rotation-${EnvType}:FunctionRoleArn"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+              Bool:
+                aws:PrincipalIsAWSService: "false"
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub "${AWS::StackName}:ClusterName"
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}:ClusterArn"
+  MigrateTaskDefinitionArn:
+    Value: !Ref MigrateTaskDefinition
+  MigrateTaskDefinitionFamily:
+    Value: !Sub "ecst-${RegionCode}-${Context}-migrate-${EnvType}"
+  MigrateTaskRoleArn:
+    Value: !GetAtt MigrateTaskRole.Arn
+  MigrateExecRoleArn:
+    Value: !GetAtt MigrateExecRole.Arn
+  MigrateLogGroupName:
+    Value: !Ref MigrateLogGroup
+  # Terraform also passes the job subnets and security group through this unit (migrate_subnet_ids,
+  # migrate_security_group_id); the pipeline reads them from the network stack outputs instead
+  # (PrivateSubnetIds, JobSecurityGroupId), because re-exporting an import is discouraged (cfn-lint W6001).

@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >-
+  Edge stack (twin of the Terraform unit "edge", module modules/edge): internet-facing load balancer,
+  HTTPS (TLS 1.3 policy) and HTTP listeners, one HTTPS target group per service, the preflight and token
+  (jwt-validation) listener rules, the WAF association in prod and the two SSM parameters published for
+  the webpage repository.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  TaskPort:
+    Type: Number
+    Default: 8443
+  AlbDeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Load balancer deletion protection (ELB-03, true in prod)
+  ApiCertificateArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: >-
+      Name of the SSM parameter published by the webpage repository with the API certificate ARN
+      (/<context>/<env>/api-certificate-arn); CloudFormation resolves its value.
+  CognitoUserPoolId:
+    Type: String
+    MinLength: 1
+    Description: Cognito user pool whose ID tokens the load balancer verifies (GitHub variable COGNITO_USER_POOL_ID)
+  CognitoAppClientId:
+    Type: String
+    MinLength: 1
+    Description: Cognito app client ID expected in the aud claim (GitHub variable COGNITO_APP_CLIENT_ID)
+  EnableWaf:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Associate the shared WAF ACL (ELB-11, prod only)
+  WafAclArn:
+    Type: String
+    Default: ""
+    Description: ARN of the shared regional WAF ACL (GitHub variable WAF_ACL_ARN)
+
+Conditions:
+  AssociateWaf: !And
+    - !Equals [!Ref EnableWaf, "true"]
+    - !Not [!Equals [!Ref WafAclArn, ""]]
+
+# Order fixes the rule priorities: preflight 10..50, token 110..150 (every preflight before every token).
+Mappings:
+  RulePriority:
+    add:
+      Preflight: 10
+      Token: 110
+    sub:
+      Preflight: 20
+      Token: 120
+    mul:
+      Preflight: 30
+      Token: 130
+    div:
+      Preflight: 40
+      Token: 140
+    history:
+      Preflight: 50
+      Token: 150
+
+Resources:
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "alb-${RegionCode}-${Context}-api-${EnvType}"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Split
+        - ","
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:PublicSubnetIds"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:AlbSecurityGroupId"
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: !Ref AlbDeletionProtection
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:AlbLogBucketName"
+        - Key: access_logs.s3.prefix
+          Value:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-storage-${EnvType}:AlbLogPrefix"
+
+  # Anything that matches no service rule is a 404; no default forward.
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ApiCertificateArn
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: application/json
+            MessageBody: '{"error":{"code":"NOT_FOUND","message":"Not found"}}'
+            StatusCode: "404"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Port: "443"
+            Protocol: HTTPS
+            StatusCode: HTTP_301
+
+  # Target groups: HTTPS to the tasks, health route without token. Listener rules: two per service.
+  Fn::ForEach::Services:
+    - Svc
+    - [add, sub, mul, div, history]
+    - TargetGroup${Svc}:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+          Name: !Sub "tg-${RegionCode}-${Context}-${Svc}-${EnvType}"
+          TargetType: ip
+          Protocol: HTTPS
+          ProtocolVersion: HTTP1
+          Port: !Ref TaskPort
+          VpcId:
+            Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:VpcId"
+          TargetGroupAttributes:
+            - Key: deregistration_delay.timeout_seconds
+              Value: "30"
+          HealthCheckEnabled: true
+          HealthCheckProtocol: HTTPS
+          HealthCheckPath: /health
+          HealthCheckPort: traffic-port
+          Matcher:
+            HttpCode: "200"
+          HealthCheckIntervalSeconds: 15
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+
+      # Preflight: OPTIONS on the service paths, forward without token.
+      PreflightRule${Svc}:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+          ListenerArn: !Ref HttpsListener
+          Priority: !FindInMap [RulePriority, !Ref Svc, Preflight]
+          Actions:
+            - Type: forward
+              TargetGroupArn: !Ref
+                Fn::Sub: "TargetGroup${Svc}"
+          Conditions:
+            - Field: http-request-method
+              HttpRequestMethodConfig:
+                Values: [OPTIONS]
+            - Field: path-pattern
+              PathPatternConfig:
+                Values:
+                  - !Sub "/api/v1/${Svc}"
+                  - !Sub "/api/ecs/v1/${Svc}"
+
+      # Token: any method on the same paths, jwt-validation of the Cognito ID token, then forward.
+      TokenRule${Svc}:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+          ListenerArn: !Ref HttpsListener
+          Priority: !FindInMap [RulePriority, !Ref Svc, Token]
+          Actions:
+            - Type: jwt-validation
+              Order: 1
+              JwtValidationConfig:
+                Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}"
+                JwksEndpoint: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}/.well-known/jwks.json"
+                AdditionalClaims:
+                  - Format: single-string
+                    Name: aud
+                    Values:
+                      - !Ref CognitoAppClientId
+                  - Format: single-string
+                    Name: token_use
+                    Values:
+                      - id
+            - Type: forward
+              Order: 2
+              TargetGroupArn: !Ref
+                Fn::Sub: "TargetGroup${Svc}"
+          Conditions:
+            - Field: path-pattern
+              PathPatternConfig:
+                Values:
+                  - !Sub "/api/v1/${Svc}"
+                  - !Sub "/api/ecs/v1/${Svc}"
+
+  # Shared regional WAF ACL (ELB-11): prod only, when its ARN is provided.
+  WafAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: AssociateWaf
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !Ref WafAclArn
+
+  # Target published for the webpage repository (weighted alias record).
+  DnsNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Context}/${EnvType}/api-backends/ecs/dns-name"
+      Type: String
+      Tier: Standard
+      Description: DNS name of the ECS API load balancer
+      Value: !GetAtt LoadBalancer.DNSName
+
+  HostedZoneIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Context}/${EnvType}/api-backends/ecs/hosted-zone-id"
+      Type: String
+      Tier: Standard
+      Description: Canonical hosted zone ID of the ECS API load balancer
+      Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+Outputs:
+  AlbArn:
+    Value: !Ref LoadBalancer
+  AlbFullName:
+    Description: app/<name>/<id>, the LoadBalancer dimension of the CloudWatch metrics
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+    Export:
+      Name: !Sub "${AWS::StackName}:AlbFullName"
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  AlbZoneId:
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+  HttpsListenerArn:
+    Value: !Ref HttpsListener
+  Fn::ForEach::TargetGroupOutputs:
+    - Svc
+    - [add, sub, mul, div, history]
+    - TargetGroupArn${Svc}:
+        Value: !Ref
+          Fn::Sub: "TargetGroup${Svc}"
+        Export:
+          Name: !Sub "${AWS::StackName}:TargetGroupArn-${Svc}"
+      TargetGroupFullName${Svc}:
+        Description: targetgroup/<name>/<id>, the TargetGroup dimension of the CloudWatch metrics
+        Value: !GetAtt
+          - !Sub "TargetGroup${Svc}"
+          - TargetGroupFullName
+        Export:
+          Name: !Sub "${AWS::StackName}:TargetGroupFullName-${Svc}"

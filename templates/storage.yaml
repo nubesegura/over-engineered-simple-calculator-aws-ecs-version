@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Storage stack (twin of the Terraform unit "storage", module modules/storage): CSV ingestion bucket and
+  load balancer access log bucket with their policies. Terraform splits each bucket into seven or eight
+  resources (public access block, ownership, versioning, encryption, lifecycle, notification); here they
+  are properties of one AWS::S3::Bucket.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  IngestProcessedRetentionDays:
+    Type: Number
+    Description: Days before objects under processed/ expire
+  IngestRejectedRetentionDays:
+    Type: Number
+    Description: Days before objects under rejected/ expire
+  IngestReportsRetentionDays:
+    Type: Number
+    Description: Days before objects under reports/ expire
+  NoncurrentRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Days before noncurrent object versions expire (both buckets)
+  AlbLogRetentionDays:
+    Type: Number
+    Description: Days before load balancer access logs expire
+  AlbLogPrefix:
+    Type: String
+    Default: alb
+    Description: Prefix of the load balancer access logs inside the log bucket
+  ElbLogDeliveryAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^([0-9]{12})?$"
+    Description: >-
+      Regional Elastic Load Balancing account of the legacy log delivery policy (what Terraform uses through
+      data.aws_elb_service_account). Empty uses the log delivery service principal that AWS now recommends.
+      Owner decision, see the parity report.
+
+Conditions:
+  UseLegacyElbAccount: !Not [!Equals [!Ref ElbLogDeliveryAccountId, ""]]
+
+Resources:
+  # =========================================================
+  # Ingestion bucket: CSV drop, SSE-KMS, EventBridge notifications
+  # =========================================================
+  IngestBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "bckt-${RegionCode}-${Context}-ecs-ingest-${AWS::AccountId}-${EnvType}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID:
+                Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-processed
+            Status: Enabled
+            Prefix: processed/
+            ExpirationInDays: !Ref IngestProcessedRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-rejected
+            Status: Enabled
+            Prefix: rejected/
+            ExpirationInDays: !Ref IngestRejectedRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-reports
+            Status: Enabled
+            Prefix: reports/
+            ExpirationInDays: !Ref IngestReportsRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          # Everything else (incoming/ objects are moved by the job): clean old versions only.
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      # Object created events go to EventBridge (the rule filters incoming/*.csv).
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # The bucket policy only enforces TLS (S3-13).
+  IngestBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IngestBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt IngestBucket.Arn
+              - !Sub "${IngestBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # =========================================================
+  # Load balancer access log bucket: SSE-S3 (log delivery does not support customer managed keys)
+  # =========================================================
+  AlbLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "bckt-${RegionCode}-${Context}-ecs-alblogs-${AWS::AccountId}-${EnvType}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: !Ref AlbLogRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  AlbLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AlbLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLoadBalancerLogDelivery
+            Effect: Allow
+            Principal: !If
+              - UseLegacyElbAccount
+              - AWS: !Sub "arn:${AWS::Partition}:iam::${ElbLogDeliveryAccountId}:root"
+              - Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${AlbLogBucket.Arn}/${AlbLogPrefix}/AWSLogs/${AWS::AccountId}/*"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt AlbLogBucket.Arn
+              - !Sub "${AlbLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  IngestBucketName:
+    Value: !Ref IngestBucket
+    Export:
+      Name: !Sub "${AWS::StackName}:IngestBucketName"
+  IngestBucketArn:
+    Value: !GetAtt IngestBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}:IngestBucketArn"
+  AlbLogBucketName:
+    Value: !Ref AlbLogBucket
+    Export:
+      Name: !Sub "${AWS::StackName}:AlbLogBucketName"
+  AlbLogBucketArn:
+    Value: !GetAtt AlbLogBucket.Arn
+  AlbLogPrefix:
+    Value: !Ref AlbLogPrefix
+    Export:
+      Name: !Sub "${AWS::StackName}:AlbLogPrefix"

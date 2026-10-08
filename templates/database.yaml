@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Database stack (twin of the Terraform unit "database", module modules/database): DB subnet group,
+  parameter group, exported log groups (prod), PostgreSQL 17 instance with the master secret managed by
+  RDS, and the rotation schedule of that secret.
+
+Parameters:
+  EnvType:
+    Type: String
+    AllowedValues: [dev, prod]
+  Context:
+    Type: String
+    Default: oecalc
+    AllowedPattern: "^[a-z0-9]+$"
+  RegionCode:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+  InstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  AllocatedStorageGb:
+    Type: Number
+    Default: 20
+  DbName:
+    Type: String
+    Default: calculator
+  DbBackupRetentionDays:
+    Type: Number
+    Description: Automated backup retention in days (1 in dev, 15 in prod)
+  DbDeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+  EnableDbLogExports:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Ship the postgresql and upgrade logs to CloudWatch Logs (prod only)
+  LogRetentionDays:
+    Type: Number
+  MasterRotationDays:
+    Type: Number
+    Default: 3
+    Description: Days between rotations of the RDS-managed master secret
+
+Conditions:
+  IsProd: !Equals [!Ref EnvType, prod]
+  IsDev: !Equals [!Ref EnvType, dev]
+  ExportLogs: !Equals [!Ref EnableDbLogExports, "true"]
+
+Resources:
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "dbsg-${RegionCode}-${Context}-${EnvType}"
+      DBSubnetGroupDescription: Private subnets of both AZs for the calculator database
+      SubnetIds: !Split
+        - ","
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:PrivateSubnetIds"
+
+  ParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub "dbpg-${RegionCode}-${Context}-${EnvType}"
+      Family: postgres17
+      Description: "Calculator database: TLS required"
+      Parameters:
+        rds.force_ssl: "1"
+
+  # Exported engine logs: created here (not by RDS) so they have the key and retention.
+  PostgresqlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ExportLogs
+    Properties:
+      LogGroupName: !Sub "/aws/rds/instance/rds-${RegionCode}-${Context}-${EnvType}/postgresql"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+  UpgradeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ExportLogs
+    Properties:
+      LogGroupName: !Sub "/aws/rds/instance/rds-${RegionCode}-${Context}-${EnvType}/upgrade"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+
+  # Deletion safety equals Terraform (prod: final snapshot; dev: no snapshot, nothing kept). DeletionPolicy
+  # and UpdateReplacePolicy take literal values only (the documentation allows Fn::If in Metadata,
+  # UpdatePolicy and property values), so the instance is declared twice with opposite conditions on
+  # EnvType: exactly one exists per environment, with the same physical name.
+  DbInstanceProd:
+    Type: AWS::RDS::DBInstance
+    Condition: IsProd
+    Metadata:
+      cfn-lint:
+        config:
+          # W3691 flags EngineVersion "17" as deprecated because it is not a full version from the bundled
+          # list. A major-version prefix is accepted by RDS and CloudFormation (prefix matching), and it is
+          # what Terraform sets (engine_version = "17" with ignore_changes).
+          ignore_checks: [W3691]
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "rds-${RegionCode}-${Context}-${EnvType}"
+      # Major version only: AWS picks the current minor and automatic minor upgrades move it.
+      Engine: postgres
+      EngineVersion: "17"
+      DBInstanceClass: !Ref InstanceClass
+      StorageType: gp3
+      AllocatedStorage: !Ref AllocatedStorageGb
+      StorageEncrypted: true
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+      MultiAZ: false # owner-accepted exception: Single-AZ
+      PubliclyAccessible: false
+      Port: "5432"
+      DBName: !Ref DbName
+      DBSubnetGroupName: !Ref SubnetGroup
+      DBParameterGroupName: !Ref ParameterGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:DbSecurityGroupId"
+      # No password: RDS creates and rotates the master secret in Secrets Manager.
+      MasterUsername: calcadmin
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId:
+          Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+      EnableIAMDatabaseAuthentication: false
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeleteAutomatedBackups: true
+      EnablePerformanceInsights: false
+      BackupRetentionPeriod: !Ref DbBackupRetentionDays
+      DeletionProtection: !Ref DbDeletionProtection
+      # The Select over a two-item list returns the log type and references the log group, so the
+      # instance is created after its log groups (Terraform depends_on) without a conditional DependsOn.
+      EnableCloudwatchLogsExports: !If
+        - ExportLogs
+        - - !Select [0, [postgresql, !Ref PostgresqlLogGroup]]
+          - !Select [0, [upgrade, !Ref UpgradeLogGroup]]
+        - !Ref AWS::NoValue
+
+  DbInstanceDev:
+    Type: AWS::RDS::DBInstance
+    Condition: IsDev
+    Metadata:
+      cfn-lint:
+        config:
+          # W3691 flags EngineVersion "17" as deprecated because it is not a full version from the bundled
+          # list. A major-version prefix is accepted by RDS and CloudFormation (prefix matching), and it is
+          # what Terraform sets (engine_version = "17" with ignore_changes).
+          ignore_checks: [W3691]
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "rds-${RegionCode}-${Context}-${EnvType}"
+      # Major version only: AWS picks the current minor and automatic minor upgrades move it.
+      Engine: postgres
+      EngineVersion: "17"
+      DBInstanceClass: !Ref InstanceClass
+      StorageType: gp3
+      AllocatedStorage: !Ref AllocatedStorageGb
+      StorageEncrypted: true
+      KmsKeyId:
+        Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+      MultiAZ: false # owner-accepted exception: Single-AZ
+      PubliclyAccessible: false
+      Port: "5432"
+      DBName: !Ref DbName
+      DBSubnetGroupName: !Ref SubnetGroup
+      DBParameterGroupName: !Ref ParameterGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-network-${EnvType}:DbSecurityGroupId"
+      # No password: RDS creates and rotates the master secret in Secrets Manager.
+      MasterUsername: calcadmin
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId:
+          Fn::ImportValue: !Sub "stk-${RegionCode}-${Context}-security-${EnvType}:KmsKeyArn"
+      EnableIAMDatabaseAuthentication: false
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeleteAutomatedBackups: true
+      EnablePerformanceInsights: false
+      BackupRetentionPeriod: !Ref DbBackupRetentionDays
+      DeletionProtection: !Ref DbDeletionProtection
+      # The Select over a two-item list returns the log type and references the log group, so the
+      # instance is created after its log groups (Terraform depends_on) without a conditional DependsOn.
+      EnableCloudwatchLogsExports: !If
+        - ExportLogs
+        - - !Select [0, [postgresql, !Ref PostgresqlLogGroup]]
+          - !Select [0, [upgrade, !Ref UpgradeLogGroup]]
+        - !Ref AWS::NoValue
+
+  # Rotation schedule of the RDS-managed master secret: managed rotation, so no Lambda is set. The first
+  # rotation happens at the first schedule.
+  MasterSecretRotation:
+    Type: AWS::SecretsManager::RotationSchedule
+    Properties:
+      SecretId: !If [IsProd, !GetAtt DbInstanceProd.MasterUserSecret.SecretArn, !GetAtt DbInstanceDev.MasterUserSecret.SecretArn]
+      RotateImmediatelyOnUpdate: false
+      RotationRules:
+        AutomaticallyAfterDays: !Ref MasterRotationDays
+
+Outputs:
+  EndpointAddress:
+    Description: DNS name of the database instance
+    Value: !If [IsProd, !GetAtt DbInstanceProd.Endpoint.Address, !GetAtt DbInstanceDev.Endpoint.Address]
+    Export:
+      Name: !Sub "${AWS::StackName}:EndpointAddress"
+  Port:
+    Value: !If [IsProd, !GetAtt DbInstanceProd.Endpoint.Port, !GetAtt DbInstanceDev.Endpoint.Port]
+    Export:
+      Name: !Sub "${AWS::StackName}:Port"
+  DbName:
+    Value: !Ref DbName
+    Export:
+      Name: !Sub "${AWS::StackName}:DbName"
+  MasterSecretArn:
+    Description: ARN of the master secret created and rotated by RDS
+    Value: !Ref MasterSecretRotation # Ref returns the ARN of the configured secret
+    Export:
+      Name: !Sub "${AWS::StackName}:MasterSecretArn"
+  # A secret ARN is "<name>-<6 random characters>" and the RDS name is "rds!db-<uuid>": the name without the
+  # suffix is the first six hyphen-separated parts. Used by the failed-rotation rule (rotation stack).
+  MasterSecretNamePrefix:
+    Value: !Join
+      - "-"
+      - - !Select [0, !Split ["-", !Select [1, !Split [":secret:", !Ref MasterSecretRotation]]]]
+        - !Select [1, !Split ["-", !Select [1, !Split [":secret:", !Ref MasterSecretRotation]]]]
+        - !Select [2, !Split ["-", !Select [1, !Split [":secret:", !Ref MasterSecretRotation]]]]
+        - !Select [3, !Split ["-", !Select [1, !Split [":secret:", !Ref MasterSecretRotation]]]]
+        - !Select [4, !Split ["-", !Select [1, !Split [":secret:", !Ref MasterSecretRotation]]]]
+        - !Select [5, !Split ["-", !Select [1, !Split [":secret:", !Ref MasterSecretRotation]]]]
+    Export:
+      Name: !Sub "${AWS::StackName}:MasterSecretNamePrefix"
+  InstanceIdentifier:
+    Value: !If [IsProd, !Ref DbInstanceProd, !Ref DbInstanceDev]
+    Export:
+      Name: !Sub "${AWS::StackName}:InstanceIdentifier"

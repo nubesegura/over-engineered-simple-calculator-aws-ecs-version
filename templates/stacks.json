@@ -1,0 +1,37 @@
+{
+  "description": "CloudFormation stacks of this repository in deploy order (one stack per Terragrunt unit). Read by scripts/cfn_deploy.py and scripts/iac_owner_guard.py. Destroy runs the same list in reverse order.",
+  "region": "us-east-2",
+  "repository": "over-engineered-simple-calculator-aws-ecs-version",
+  "terraformStateBucketPattern": "bckt-{region_code}-tf-state-{env}-{account_id}",
+  "terraformStateKeyPattern": "{repository}/{env}/{unit}/terraform.tfstate",
+  "environments": {
+    "dev": [
+      {"unit": "security", "stack": "stk-useast2-oecalc-security-dev", "template": "templates/security.yaml", "phase": 1, "sam": false},
+      {"unit": "network", "stack": "stk-useast2-oecalc-network-dev", "template": "templates/network.yaml", "phase": 1, "sam": false},
+      {"unit": "scheduler", "stack": "stk-useast2-oecalc-scheduler-dev", "template": "templates/scheduler.yaml", "phase": 1, "sam": true},
+      {"unit": "registry", "stack": "stk-useast2-oecalc-registry-dev", "template": "templates/registry.yaml", "phase": 1, "sam": false},
+      {"unit": "storage", "stack": "stk-useast2-oecalc-storage-dev", "template": "templates/storage.yaml", "phase": 1, "sam": false},
+      {"unit": "database", "stack": "stk-useast2-oecalc-database-dev", "template": "templates/database.yaml", "phase": 1, "sam": false},
+      {"unit": "rotation", "stack": "stk-useast2-oecalc-rotation-dev", "template": "templates/rotation.yaml", "phase": 1, "sam": true},
+      {"unit": "cluster", "stack": "stk-useast2-oecalc-cluster-dev", "template": "templates/cluster.yaml", "phase": 1, "sam": false},
+      {"unit": "edge", "stack": "stk-useast2-oecalc-edge-dev", "template": "templates/edge.yaml", "phase": 2, "sam": false},
+      {"unit": "services", "stack": "stk-useast2-oecalc-services-dev", "template": "templates/services.yaml", "phase": 2, "sam": false},
+      {"unit": "ingestion", "stack": "stk-useast2-oecalc-ingestion-dev", "template": "templates/ingestion.yaml", "phase": 2, "sam": false},
+      {"unit": "alarms", "stack": "stk-useast2-oecalc-alarms-dev", "template": "templates/alarms.yaml", "phase": 2, "sam": false}
+    ],
+    "prod": [
+      {"unit": "security", "stack": "stk-useast2-oecalc-security-prod", "template": "templates/security.yaml", "phase": 1, "sam": false},
+      {"unit": "network", "stack": "stk-useast2-oecalc-network-prod", "template": "templates/network.yaml", "phase": 1, "sam": false},
+      {"unit": "scheduler", "stack": "stk-useast2-oecalc-scheduler-prod", "template": "templates/scheduler.yaml", "phase": 1, "sam": true},
+      {"unit": "registry", "stack": "stk-useast2-oecalc-registry-prod", "template": "templates/registry.yaml", "phase": 1, "sam": false},
+      {"unit": "storage", "stack": "stk-useast2-oecalc-storage-prod", "template": "templates/storage.yaml", "phase": 1, "sam": false},
+      {"unit": "database", "stack": "stk-useast2-oecalc-database-prod", "template": "templates/database.yaml", "phase": 1, "sam": false},
+      {"unit": "rotation", "stack": "stk-useast2-oecalc-rotation-prod", "template": "templates/rotation.yaml", "phase": 1, "sam": true},
+      {"unit": "cluster", "stack": "stk-useast2-oecalc-cluster-prod", "template": "templates/cluster.yaml", "phase": 1, "sam": false},
+      {"unit": "edge", "stack": "stk-useast2-oecalc-edge-prod", "template": "templates/edge.yaml", "phase": 2, "sam": false},
+      {"unit": "services", "stack": "stk-useast2-oecalc-services-prod", "template": "templates/services.yaml", "phase": 2, "sam": false},
+      {"unit": "ingestion", "stack": "stk-useast2-oecalc-ingestion-prod", "template": "templates/ingestion.yaml", "phase": 2, "sam": false},
+      {"unit": "alarms", "stack": "stk-useast2-oecalc-alarms-prod", "template": "templates/alarms.yaml", "phase": 2, "sam": false}
+    ]
+  }
+}
