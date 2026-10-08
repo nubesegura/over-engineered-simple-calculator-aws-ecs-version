@@ -62,6 +62,15 @@ class S3ObjectStore:
         self._client = client
         self._bucket = bucket
 
+    def size(self, key: str) -> int:
+        _require_ingest_key(key)
+        try:
+            return int(self._client.head_object(Bucket=self._bucket, Key=key)["ContentLength"])
+        except ClientError as error:
+            raise self._read_error(error) from error
+        except BotoCoreError as error:
+            raise InfrastructureError("The object could not be read.", error) from error
+
     def get(self, key: str, max_bytes: int) -> bytes:
         _require_ingest_key(key)
         try:
@@ -71,9 +80,7 @@ class S3ObjectStore:
             body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
             data: bytes = body.read(max_bytes + 1)
         except ClientError as error:
-            if error.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
-                raise ObjectNotFoundError("The object does not exist.") from None
-            raise InfrastructureError("The object could not be read.", error) from error
+            raise self._read_error(error) from error
         except BotoCoreError as error:
             raise InfrastructureError("The object could not be read.", error) from error
         if len(data) > max_bytes:
@@ -106,6 +113,12 @@ class S3ObjectStore:
             lambda: self._client.delete_object(Bucket=self._bucket, Key=key),
             "The source object could not be deleted.",
         )
+
+    @staticmethod
+    def _read_error(error: ClientError) -> Exception:
+        if error.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
+            return ObjectNotFoundError("The object does not exist.")
+        return InfrastructureError("The object could not be read.", error)
 
     @staticmethod
     def _guarded(call: Any, message: str) -> None:

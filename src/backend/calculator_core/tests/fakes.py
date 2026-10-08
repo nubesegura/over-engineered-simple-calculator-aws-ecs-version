@@ -45,6 +45,9 @@ class InMemoryObjectStore:
         self.reports: dict[str, str] = {}
         self.moves: list[tuple[str, str]] = []
 
+    def size(self, key: str) -> int:
+        return len(self.objects[key])
+
     def get(self, key: str, max_bytes: int) -> bytes:
         data = self.objects[key]
         if len(data) > max_bytes:

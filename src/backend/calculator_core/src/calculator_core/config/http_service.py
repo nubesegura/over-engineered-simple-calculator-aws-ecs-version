@@ -14,7 +14,7 @@ from calculator_core.adapters.inbound.http_app import (
 from calculator_core.adapters.inbound.self_signed_tls import self_signed_files
 from calculator_core.config.container import Container, build_container
 from calculator_core.config.observability import configure_logging, set_request_context
-from calculator_core.config.settings import load_settings
+from calculator_core.config.settings import BACKEND_NAME, load_settings
 from calculator_core.domain.operation import Operation
 
 PORT = 8443
@@ -39,6 +39,7 @@ def build_service_app(service: str, container: Container) -> ASGIApp:
         service_name=settings.service_name,
         environment=settings.environment,
         cors_allowed_origin=settings.cors_allowed_origin,
+        backend_name=BACKEND_NAME,
     )
     operation = _CALCULATION_SERVICES.get(service)
     return create_app(

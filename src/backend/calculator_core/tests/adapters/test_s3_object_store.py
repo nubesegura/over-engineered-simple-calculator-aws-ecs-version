@@ -116,3 +116,14 @@ def test_move_failures_and_foreign_keys_leave_the_source_in_place(s3: Any) -> No
 def test_a_failed_write_becomes_an_infrastructure_error(s3: Any) -> None:
     with pytest.raises(InfrastructureError):
         S3ObjectStore(s3, "no-such-bucket-here").put_report(KEY, REPORT)
+
+
+def test_size_returns_the_content_length_and_reports_missing_and_foreign_keys(s3: Any) -> None:
+    s3.put_object(Bucket=BUCKET, Key=KEY, Body=b"abcd")
+    store = S3ObjectStore(s3, BUCKET)
+
+    assert store.size(KEY) == 4
+    with pytest.raises(ObjectNotFoundError):
+        store.size("incoming/missing.csv")
+    with pytest.raises(UnacceptedKeyError):
+        store.size("processed/x.csv")

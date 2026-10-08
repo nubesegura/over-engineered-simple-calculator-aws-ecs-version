@@ -41,6 +41,22 @@ Steps of `deploy.yml`: validate variables and branch, verify the account, phase 
 
 GitHub environment secrets `ROLE_ARN`, `AWS_ACCOUNT_ID`, `SUPPORT_EMAIL`; variables `AWS_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_APP_CLIENT_ID`, `WAF_ACL_ARN` (`prod`). AWS access is by OIDC with the role `github-actions-terraform-<env>-role`.
 
+## Logs of the operation
+
+The HTTP app and the ingestion job write structured JSON logs (the formatter adds `correlation_id` and `sub`; for an exception it emits the type and the frames, not the message, by design). `/health` writes nothing (the load balancer calls it all the time); the existing access log is unchanged.
+
+| Level | Message | When |
+|---|---|---|
+| INFO | `Request received: method=%s path=%s request_id=%s body=%r` (`query=%r` for history) | Every API request; body and query cut at 2000 characters and written with `%r` (newlines and control characters are escaped); a body that is too large is not read (`body=<not read: too large>`) |
+| INFO | `Response sent: status=%d request_id=%s body=%s` | Every API response, body cut at 2000 characters |
+| WARNING | `Request rejected: code=%s reason=%s request_id=%s received=%r` | Invalid JSON, missing field, non-numeric operand, division by zero, invalid query, body too large |
+| ERROR | `Internal error while processing the request: method=%s path=%s request_id=%s` (with stack trace) | Unexpected error; the client still receives the generic 500 |
+| INFO | `Ingestion started: bucket=%r key=%r size_bytes=%d` | Start of the ingestion job (one `head_object`, covered by the existing `s3:GetObject`) |
+| INFO / ERROR | `Ingestion finished: bucket=%r key=%r rows_read=%d rows_accepted=%d rows_rejected=%d file_rejected=%s reasons=[...]` | End of the job; at most 10 reasons (`line N: reason`); ERROR when the whole file was rejected |
+| ERROR | `Ingestion failed: bucket=%r key=%r error_type=%s` (with stack trace) | Infrastructure failure of the job |
+
+Never logged: request headers, the `Authorization` value and tokens (a test with a real-looking JWT asserts it). The request body is logged (up to 2000 characters) and kept as long as the log group retention; today it holds only two numbers and the API needs a Cognito token. Revisit the logging if the API ever accepts free text or if people other than the owner can read the logs. The backend name is `BACKEND_NAME` in `config/settings.py` and reaches `HttpAppConfig` from the HTTP service entrypoint; only the calculation response carries `backend` (`calculation_response_to_json`), history items use `calculation_to_json`.
+
 ## Local checks
 
 From `src/backend/calculator_core`: `ruff check . && ruff format --check .`, `mypy`, `PYTHONPATH=src lint-imports`, `pytest` (PostgreSQL tests run when `TEST_DATABASE_URL` is set). Infrastructure: `terraform fmt -check -recursive`, `terragrunt hcl fmt --check`, `terraform validate` per module.

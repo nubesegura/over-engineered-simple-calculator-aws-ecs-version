@@ -18,6 +18,9 @@ class ObjectNotFoundError(InvalidInputError):
 
 
 class ObjectStore(Protocol):
+    def size(self, key: str) -> int:
+        """Size in bytes of an object; raises `ObjectNotFoundError` when it does not exist."""
+
     def get(self, key: str, max_bytes: int) -> bytes:
         """Read an object without reading more than `max_bytes` (+ 1) bytes.
 

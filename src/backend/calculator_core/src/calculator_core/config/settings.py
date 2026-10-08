@@ -7,6 +7,8 @@ names the variables (never their values).
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+# Names the implementation that answers; sent in every calculation response (never configurable).
+BACKEND_NAME = "ecs"
 ENVIRONMENTS = ("local", "dev", "prod")
 _REQUIRED_OUTSIDE_LOCAL = (
     "SERVICE_NAME",

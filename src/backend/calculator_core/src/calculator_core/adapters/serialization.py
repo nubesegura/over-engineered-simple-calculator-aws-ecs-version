@@ -27,6 +27,11 @@ def calculation_to_json(calculation: Calculation) -> JsonDict:
     }
 
 
+def calculation_response_to_json(calculation: Calculation, backend: str) -> JsonDict:
+    """Body of a successful calculation: the calculation plus the backend that answered."""
+    return {**calculation_to_json(calculation), "backend": backend}
+
+
 def history_to_json(page: HistoryPage) -> JsonDict:
     return {
         "items": [

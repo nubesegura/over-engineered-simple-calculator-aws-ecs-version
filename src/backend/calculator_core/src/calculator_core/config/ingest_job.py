@@ -19,20 +19,24 @@ from calculator_core.adapters.outbound.s3_object_store import (
 )
 from calculator_core.application.ports.error_notifier import InternalErrorReport
 from calculator_core.application.ports.object_store import ObjectNotFoundError, ObjectStore
-from calculator_core.application.use_cases.ingest_csv import IngestCsv
+from calculator_core.application.use_cases.ingest_csv import IngestCsv, IngestResult
 from calculator_core.config.container import Container, build_container
 from calculator_core.config.observability import configure_logging
 from calculator_core.config.settings import load_ingest_settings, load_settings
 
 logger = logging.getLogger(__name__)
 
+MAX_LOGGED_REASONS = 10
 
-def run_ingest(container: Container, store: ObjectStore, key: str) -> int:
+
+def run_ingest(container: Container, store: ObjectStore, bucket: str, key: str) -> int:
     """Ingest one object and return the process exit code (non-zero on infrastructure errors)."""
     if not is_ingest_key(key):
         logger.warning("Ignoring a key outside incoming/*.csv.")
         return 0
     try:
+        size = store.size(key)
+        logger.info("Ingestion started: bucket=%r key=%r size_bytes=%d", bucket, key, size)
         result = IngestCsv(store, container.repository).execute(key)
         store.put_report(key, result.to_report(key))
         store.move(key, "rejected" if result.rejected else "processed")
@@ -40,19 +44,33 @@ def run_ingest(container: Container, store: ObjectStore, key: str) -> int:
         logger.warning("The object no longer exists; nothing to do.")
         return 0
     except Exception as error:
-        logger.error("Ingestion failed (%s).", type(error).__name__)
+        logger.exception(
+            "Ingestion failed: bucket=%r key=%r error_type=%s", bucket, key, type(error).__name__
+        )
         _notify(container, type(error).__name__, "The ingestion job failed; see the task logs.")
         return 1
     if result.rejected:
         _notify(container, "FileRejected", result.rejection or "The file was rejected.")
-    logger.info(
-        "Ingestion finished: read=%d saved=%d skipped=%d rejected=%s.",
+    _log_summary(bucket, key, result)
+    return 0
+
+
+def _log_summary(bucket: str, key: str, result: IngestResult) -> None:
+    reasons = [f"line {row.line}: {row.reason}" for row in result.skipped[:MAX_LOGGED_REASONS]]
+    if result.rejection:
+        reasons.insert(0, result.rejection)
+    logger.log(
+        logging.ERROR if result.rejected else logging.INFO,
+        "Ingestion finished: bucket=%r key=%r rows_read=%d rows_accepted=%d rows_rejected=%d "
+        "file_rejected=%s reasons=%s",
+        bucket,
+        key,
         result.read,
         result.saved,
         len(result.skipped),
         result.rejected,
+        reasons[:MAX_LOGGED_REASONS],
     )
-    return 0
 
 
 def main() -> int:
@@ -65,7 +83,7 @@ def main() -> int:
     except Exception as error:
         logger.error("Ingestion job could not start (%s).", type(error).__name__)
         return 1
-    return run_ingest(container, store, ingest.key)
+    return run_ingest(container, store, ingest.bucket, ingest.key)
 
 
 def _notify(container: Container, error_type: str, message: str) -> None:

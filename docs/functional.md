@@ -8,7 +8,7 @@ Base paths: `/api/v1` (neutral, shared by every backend) and `/api/ecs/v1` (own 
 
 | Method and path | Purpose |
 |---|---|
-| `POST /{add, sub, mul, div}` | Body `{"a": <number>, "b": <number>}`. Returns `200` with `calculation_id`, `operation`, `a`, `b`, `result` (strings) |
+| `POST /{add, sub, mul, div}` | Body `{"a": <number>, "b": <number>}`. Returns `200` with `calculation_id`, `operation`, `a`, `b`, `result` (strings) and `backend`, the string `ecs` (the name of the backend that answered; a constant of this repository, not in history items) |
 | `GET /history?limit=<n>&cursor=<opaque>` | Latest calculations first: `items` (`calculation_id`, `operation`, `a`, `b`, `result`, `occurred_at`) and `next_cursor` (null at the end). `limit` defaults to 20, capped at 100 |
 | `GET /health` | Used by the load balancer only; needs no token |
 | `OPTIONS <any API path>` | CORS preflight; needs no token; answers with the allowed origin of the environment |

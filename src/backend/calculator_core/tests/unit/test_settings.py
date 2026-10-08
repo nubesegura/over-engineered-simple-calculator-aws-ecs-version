@@ -8,7 +8,7 @@ from calculator_core.application.use_cases.calculate import CalculateCommand
 from calculator_core.application.use_cases.read_history import ReadHistoryQuery
 from calculator_core.config import container as container_module
 from calculator_core.config.container import build_container
-from calculator_core.config.settings import SettingsError, load_settings
+from calculator_core.config.settings import BACKEND_NAME, SettingsError, load_settings
 from calculator_core.domain.operation import Operation
 
 FULL = {
@@ -86,3 +86,8 @@ def test_outside_local_the_container_uses_postgres_and_never_the_in_memory_adapt
     container = build_container(load_settings(FULL))
 
     assert isinstance(container.repository, PostgresCalculationRepository)
+
+
+def test_backend_name_is_a_lowercase_constant_of_this_repository() -> None:
+    assert BACKEND_NAME == "ecs"
+    assert BACKEND_NAME.lower() == BACKEND_NAME

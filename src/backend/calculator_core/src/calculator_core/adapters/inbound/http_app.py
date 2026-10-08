@@ -36,7 +36,7 @@ from calculator_core.adapters.inbound.http_errors import (
     input_error_response,
     internal_error_response,
 )
-from calculator_core.adapters.serialization import calculation_to_json, history_to_json
+from calculator_core.adapters.serialization import calculation_response_to_json, history_to_json
 from calculator_core.application.errors import InvalidQueryError
 from calculator_core.application.ports.error_notifier import ErrorNotifier, InternalErrorReport
 from calculator_core.application.use_cases.calculate import Calculate, CalculateCommand
@@ -59,6 +59,7 @@ API_PREFIXES = ("/api/v1", "/api/ecs/v1")
 HEALTH_PATH = "/health"
 MAX_BODY_BYTES = 4096
 _MAX_SUBJECT_CHARS = 128
+MAX_LOGGED_CHARS = 2000
 _TRACE_ROOT = re.compile(r"Root=([0-9A-Za-z-]{1,64})")
 
 
@@ -67,6 +68,7 @@ class HttpAppConfig:
     service_name: str
     environment: str
     cors_allowed_origin: str
+    backend_name: str
     cors_allowed_methods: str = "GET, POST, OPTIONS"
     cors_allowed_headers: str = "Content-Type, Authorization"
     cors_max_age_seconds: int = 600
@@ -91,7 +93,11 @@ def create_app(
     for prefix in API_PREFIXES:
         if calculation is not None:
             path = f"{prefix}/{calculation.operation.value}"
-            routes.append(Route(path, _calculation_endpoint(calculation), methods=["POST"]))
+            routes.append(
+                Route(
+                    path, _calculation_endpoint(calculation, config.backend_name), methods=["POST"]
+                )
+            )
             contract_paths.add(path)
         if history is not None:
             path = f"{prefix}/history"
@@ -131,9 +137,11 @@ async def _health(request: Request) -> Response:
     return JSONResponse({"status": "ok"})
 
 
-def _calculation_endpoint(route: CalculationRoute) -> Callable[[Request], Awaitable[Response]]:
+def _calculation_endpoint(
+    route: CalculationRoute, backend_name: str
+) -> Callable[[Request], Awaitable[Response]]:
     async def endpoint(request: Request) -> Response:
-        body = _parse_body(await _read_body(request))
+        body = _parse_body(await _read_logged_body(request))
         command = CalculateCommand(
             operation=route.operation,
             operand_a=_operand(body, "a"),
@@ -141,19 +149,48 @@ def _calculation_endpoint(route: CalculationRoute) -> Callable[[Request], Awaita
             correlation_id=_request_id_of(request.scope),
         )
         calculation = await run_in_threadpool(route.use_case.execute, command)
-        return JSONResponse(calculation_to_json(calculation))
+        return JSONResponse(calculation_response_to_json(calculation, backend_name))
 
     return endpoint
 
 
 def _history_endpoint(use_case: ReadHistory) -> Callable[[Request], Awaitable[Response]]:
     async def endpoint(request: Request) -> Response:
+        _log_request(request, "query", request.url.query)
         params = request.query_params
         query = ReadHistoryQuery(limit=_limit(params.get("limit")), cursor=params.get("cursor"))
         page = await run_in_threadpool(use_case.execute, query)
         return JSONResponse(history_to_json(page))
 
     return endpoint
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= MAX_LOGGED_CHARS else text[:MAX_LOGGED_CHARS] + "...(truncated)"
+
+
+def _log_request(request: Request, kind: str, received: str) -> None:
+    """Log what came in (never headers) and keep it for the warning of a rejected request."""
+    clipped = _clip(received)
+    request.scope.setdefault("state", {})["received"] = clipped
+    logger.info(
+        "Request received: method=%s path=%s request_id=%s %s=%r",
+        request.method,
+        request.url.path,
+        _request_id_of(request.scope),
+        kind,
+        clipped,
+    )
+
+
+async def _read_logged_body(request: Request) -> bytes:
+    try:
+        raw = await _read_body(request)
+    except RequestValidationError:
+        _log_request(request, "body", "<not read: too large>")
+        raise
+    _log_request(request, "body", raw.decode("utf-8", errors="replace"))
+    return raw
 
 
 async def _read_body(request: Request) -> bytes:
@@ -219,6 +256,15 @@ def subject_from_authorization(header: str | None) -> str | None:
     return subject[:_MAX_SUBJECT_CHARS] if isinstance(subject, str) and subject else None
 
 
+def _log_response(status: int, request_id: str, body: bytearray) -> None:
+    logger.info(
+        "Response sent: status=%d request_id=%s body=%s",
+        status,
+        request_id,
+        _clip(body.decode("utf-8", errors="replace")),
+    )
+
+
 def _new_request_id(headers: Headers) -> str:
     """Reuse the trace root of the load balancer so one id follows the request."""
     match = _TRACE_ROOT.search(headers.get("x-amzn-trace-id", ""))
@@ -251,6 +297,8 @@ class _ContractMiddleware:
         self._set_log_context(request_id, subject)
         started = time.perf_counter()
         status = 500
+        logged = scope["path"] != HEALTH_PATH
+        body = bytearray()
 
         async def send_with_cors(message: Message) -> None:
             nonlocal status
@@ -259,6 +307,10 @@ class _ContractMiddleware:
                 MutableHeaders(scope=message)["Access-Control-Allow-Origin"] = (
                     self._config.cors_allowed_origin
                 )
+            elif message["type"] == "http.response.body" and logged:
+                body.extend(message.get("body", b"")[: MAX_LOGGED_CHARS * 4])
+                if not message.get("more_body", False):
+                    _log_response(status, request_id, body)
             await send(message)
 
         try:
@@ -284,7 +336,7 @@ class _ContractMiddleware:
         except Exception as error:
             if response_started:
                 raise
-            await self._error_response(error, request_id)(scope, receive, send)
+            await self._error_response(error, request_id, scope)(scope, receive, send)
 
     def _preflight(self) -> Response:
         return Response(
@@ -296,11 +348,22 @@ class _ContractMiddleware:
             },
         )
 
-    def _error_response(self, error: Exception, request_id: str) -> Response:
+    def _error_response(self, error: Exception, request_id: str, scope: Scope) -> Response:
         if isinstance(error, InvalidInputError):
-            logger.info("Request rejected: %s", error.code)
+            logger.warning(
+                "Request rejected: code=%s reason=%s request_id=%s received=%r",
+                error.code,
+                error,
+                request_id,
+                (scope.get("state") or {}).get("received", ""),
+            )
             return input_error_response(error, request_id)
-        logger.exception("Internal error while processing the request")
+        logger.exception(
+            "Internal error while processing the request: method=%s path=%s request_id=%s",
+            scope["method"],
+            scope["path"],
+            request_id,
+        )
         self._notify(error, request_id)
         return internal_error_response(request_id)
 

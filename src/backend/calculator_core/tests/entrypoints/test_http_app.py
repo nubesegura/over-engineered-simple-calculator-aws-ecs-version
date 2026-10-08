@@ -27,6 +27,7 @@ from tests.fakes import (
 
 ORIGIN = "https://app.example.test"
 PREFIXES = ("/api/v1", "/api/ecs/v1")
+BACKEND = "ecs"
 
 
 class RecordingNotifier:
@@ -64,7 +65,7 @@ def make_client(
         else None
     )
     app = create_app(
-        HttpAppConfig("calc-test", "dev", ORIGIN),
+        HttpAppConfig("calc-test", "dev", ORIGIN, BACKEND),
         notifier or RecordingNotifier(),
         set_request_context,
         calculation=calculation,
@@ -101,7 +102,8 @@ def test_every_operation_answers_under_both_prefixes(
     body = response.json()
     assert body["result"] == result
     assert body["operation"] == operation.value
-    assert set(body) == {"calculation_id", "operation", "a", "b", "result"}
+    assert set(body) == {"calculation_id", "operation", "a", "b", "result", "backend"}
+    assert body["backend"] == BACKEND
 
 
 def test_float_operands_keep_their_decimal_value() -> None:
@@ -189,6 +191,7 @@ def test_history_round_trip_with_pagination_and_query_errors() -> None:
     assert first["next_cursor"]
     assert len(second["items"]) == 1
     assert second["next_cursor"] is None
+    assert "backend" not in first["items"][0]
     assert set(first["items"][0]) == {
         "calculation_id",
         "operation",
@@ -323,3 +326,133 @@ def test_sub_is_truncated() -> None:
     header = f"bearer {jwt_with({'sub': 's' * 500})}"
 
     assert len(subject_from_authorization(header) or "") == 128
+
+
+def _messages(caplog: pytest.LogCaptureFixture, prefix: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith(prefix)]
+
+
+def test_request_and_response_are_logged_without_headers_or_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    token = jwt_with({"sub": "user-123", "email": "someone@example.test"})
+    client = make_client(Operation.ADD)
+
+    response = client.post(
+        "/api/v1/add", json={"a": 1, "b": 2}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    [received] = _messages(caplog, "Request received")
+    [sent] = _messages(caplog, "Response sent")
+    assert received.levelno == logging.INFO
+    assert "method=POST path=/api/v1/add" in received.getMessage()
+    assert 'body=\'{"a":1,"b":2}\'' in received.getMessage()
+    assert "request_id=" in received.getMessage()
+    assert "status=200" in sent.getMessage()
+    assert response.json()["calculation_id"] in sent.getMessage()
+    assert '"backend":"ecs"' in sent.getMessage()
+    everything = " ".join(r.getMessage() for r in caplog.records)
+    for secret in (token, token.split(".")[1], "Bearer", "someone@example.test", "authorization"):
+        assert secret not in everything
+
+
+def test_history_request_logs_the_query_and_health_is_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    client = make_client(history=True)
+
+    client.get("/health")
+    client.get("/api/v1/history", params={"limit": 2})
+
+    [received] = _messages(caplog, "Request received")
+    assert "method=GET path=/api/v1/history" in received.getMessage()
+    assert "query='limit=2'" in received.getMessage()
+    assert len(_messages(caplog, "Response sent")) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload", "reason"),
+    [
+        (Operation.ADD, b'{"a": "abc", "b": 1}', "Field 'a' must be a number."),
+        (Operation.ADD, b'{"a": 1}', "Field 'b' is required."),
+        (Operation.ADD, b"not json", "Request body must be valid JSON."),
+        (Operation.DIV, b'{"a": 1, "b": 0}', "DIVISION_BY_ZERO"),
+    ],
+)
+def test_validation_failures_are_warnings_with_reason_and_received_fields(
+    caplog: pytest.LogCaptureFixture, operation: Operation, payload: bytes, reason: str
+) -> None:
+    caplog.set_level(logging.INFO)
+
+    response = make_client(operation).post(f"/api/v1/{operation.value}", content=payload)
+
+    assert response.status_code == 400
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.getMessage().startswith("Request rejected")
+    assert reason in warning.getMessage()
+    assert payload.decode() in warning.getMessage()
+    assert "status=400" in _messages(caplog, "Response sent")[0].getMessage()
+
+
+def test_oversized_body_is_a_warning_and_the_body_is_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    padding = "9" * 5000
+
+    make_client(Operation.ADD).post("/api/v1/add", content=f'{{"a": 1, "x": "{padding}"}}')
+
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "too large" in warning.getMessage()
+    assert padding not in " ".join(r.getMessage() for r in caplog.records)
+
+
+def test_formatted_error_log_has_frames_but_never_the_exception_message() -> None:
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter("calc-test", "dev"))
+    logger = logging.getLogger("calculator_core.adapters.inbound.http_app")
+    logger.addHandler(handler)
+    try:
+        client = make_client(
+            Operation.ADD, repository=FailingRepository(RuntimeError("db password=hunter2"))
+        )
+        client.post("/api/v1/add", json={"a": 1, "b": 2})
+    finally:
+        logger.removeHandler(handler)
+
+    errors = [json.loads(line) for line in stream.getvalue().splitlines()]
+    [error] = [entry for entry in errors if entry["level"] == "ERROR"]
+    assert error["frames"]
+    assert "hunter2" not in stream.getvalue()
+    assert "password" not in stream.getvalue()
+
+
+def test_newlines_in_the_body_are_escaped_in_the_request_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+
+    make_client(Operation.ADD).post("/api/v1/add", content=b'{"a": 1,\n"b": "x\nfake"}')
+
+    [received] = _messages(caplog, "Request received")
+    assert "\n" not in received.getMessage()
+    assert "\\n" in received.getMessage()
+
+
+def test_unexpected_error_is_logged_as_error_with_the_stack_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    client = make_client(Operation.ADD, repository=FailingRepository(RuntimeError("db down")))
+
+    response = client.post("/api/v1/add", json={"a": 1, "b": 2})
+
+    assert response.status_code == 500
+    [error] = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert error.exc_info is not None
+    assert error.exc_info[2] is not None
+    assert "status=500" in _messages(caplog, "Response sent")[0].getMessage()
+    assert "Traceback" not in response.text
