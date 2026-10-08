@@ -52,3 +52,15 @@ published the API certificate (`/oecalc/<env>/api-certificate-arn`) first. The w
 pushes the images, runs the migration, applies the load balancer, services, ingestion and alarms, and ends with a smoke test.
 
 Test project: raise it, review it and destroy it. Retirement order (weights back to `sls` first, deletion protection lifted in `prod`) is in [docs/functional.md](docs/functional.md#retirement-of-the-test-deployment).
+
+## Destroying the dev environment
+
+The manual workflow **Destroy DEV** (`.github/workflows/destroy-dev.yml`) tears down this repository's `dev` environment. There are no approvers (single-user organization), so the safety is inside the workflow:
+
+1. Run it from the `develop` branch (Actions, Destroy DEV, Run workflow). The default mode is **plan**: it lists what would be destroyed and touches nothing.
+2. Read the summary of the run. To destroy, run it again with mode **destroy** and type the name of this repository in `confirm`.
+3. It uses the `dev` GitHub environment and the dev AWS account only; the account is verified before anything runs. There is no destroy workflow for `prod`.
+
+Teardown order across the repositories: the backends (`ecs`, `sls`) first, then the web page (`webpage`), then `shared-resources` (certificate and DNS of the API). The Terraform state bucket and the GitHub variables and secrets are not removed.
+
+Notes: the database and the buckets of dev are deleted with their data (dev has no deletion protection and no final snapshot). If a security group fails to delete with `DependencyViolation` because of the network interfaces of the rotation function, wait some minutes and run the workflow again.

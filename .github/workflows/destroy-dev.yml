@@ -1,0 +1,205 @@
+name: Destroy DEV
+
+# Manual teardown of the dev environment of this repository. There are no approvers (single-user
+# organization), so the safety is inside the workflow:
+#   1. mode "plan" is the default: it only shows what would be destroyed, nothing is touched;
+#   2. mode "destroy" needs the repository name typed in "confirm";
+#   3. it runs only from develop (the dev branch) with the dev GitHub environment and the dev AWS account;
+#   4. there is no destroy workflow for prod.
+# The destroy follows what is deployed, not the GitHub variable IAC_TOOL (the intent for the next deployment):
+# scripts/iac_owner_guard.py detect finds the owner of dev. owner=terraform runs Terragrunt, which destroys the
+# units in reverse dependency order; owner=cloudformation deletes the stacks of templates/stacks.json in reverse
+# deploy order (scripts/cfn_deploy.py destroy); owner=none ends green; owner=both or an unreadable owner fails.
+# An invalid or unset IAC_TOOL never blocks a destroy. Teardown order across the repositories:
+# backends (ecs, sls), then the web page, then shared-resources (certificate and DNS of the API).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "plan = show what would be destroyed (default); destroy = destroy it"
+        type: choice
+        options:
+          - plan
+          - destroy
+        default: plan
+      confirm:
+        description: "Only for mode destroy: type the name of this repository"
+        type: string
+        required: false
+
+permissions:
+  id-token: write # Required for requesting the JWT for AWS OIDC
+  contents: read
+
+env:
+  TERRAFORM_VERSION: "1.16.2"
+  TERRAGRUNT_VERSION: "1.1.5"
+
+jobs:
+  destroy:
+    name: Destroy dev
+    runs-on: ubuntu-latest
+    environment: dev
+    timeout-minutes: 120
+    # Never run a destroy and a deployment against the same state at once (same group as deploy.yml).
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: environments/dev
+    env:
+      # Read by env.hcl and the common unit files. IMAGE_TAG is only read to evaluate the units: a destroy builds nothing.
+      SUPPORT_EMAIL: ${{ secrets.SUPPORT_EMAIL }}
+      COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+      COGNITO_APP_CLIENT_ID: ${{ vars.COGNITO_APP_CLIENT_ID }}
+      WAF_ACL_ARN: ${{ vars.WAF_ACL_ARN }}
+      IMAGE_TAG: destroy
+      TG_NON_INTERACTIVE: "true"
+      TF_CLI_ARGS_plan: "-no-color"
+      # Only printed next to the detected owner; it never decides what a destroy removes.
+      IAC_TOOL_CONFIGURED: ${{ vars.IAC_TOOL }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate the request
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRM: ${{ inputs.confirm }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/develop" ]; then
+            echo "::error::Only the develop branch can destroy the dev environment (got $GITHUB_REF)"
+            exit 1
+          fi
+          if [ "$MODE" = "destroy" ] && [ "$CONFIRM" != "$REPO_NAME" ]; then
+            echo "::error::To destroy, type the repository name ($REPO_NAME) in the 'confirm' input"
+            exit 1
+          fi
+          echo "Mode: $MODE"
+
+      - name: Validate environment configuration
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ROLE_ARN_SET: ${{ secrets.ROLE_ARN != '' }}
+          AWS_ACCOUNT_ID_SET: ${{ secrets.AWS_ACCOUNT_ID != '' }}
+        run: |
+          missing=0
+          [ -n "$AWS_REGION" ] || { echo "::error::Variable 'AWS_REGION' is not set in the 'dev' GitHub environment"; missing=1; }
+          for secret in ROLE_ARN AWS_ACCOUNT_ID; do
+            flag="${secret}_SET"
+            [ "${!flag}" = "true" ] || { echo "::error::Secret '$secret' is not set in the 'dev' GitHub environment"; missing=1; }
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          if ! grep -qE "^\s*aws_region\s*=\s*\"$AWS_REGION\"" env.hcl; then
+            echo "::error::AWS_REGION does not match aws_region in environments/dev/env.hcl"
+            exit 1
+          fi
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          role-session-name: gha-destroy-dev-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify target AWS account
+        env:
+          EXPECTED_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "::add-mask::$ACTUAL_ACCOUNT"
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_ACCOUNT" ]; then
+            echo "::error::The credentials do not point to the AWS account configured for the dev GitHub environment"
+            exit 1
+          fi
+
+      # owner=terraform|cloudformation|none goes to the step output; both (exit 3) or unreadable (exit 4) fails.
+      - name: Detect the deployed owner
+        id: owner
+        working-directory: .
+        run: |
+          set -o pipefail
+          python3 scripts/iac_owner_guard.py detect --env dev | tee -a "$GITHUB_OUTPUT"
+
+      - name: Owner and IAC_TOOL
+        env:
+          OWNER: ${{ steps.owner.outputs.owner }}
+        run: |
+          CONFIGURED="${IAC_TOOL_CONFIGURED:-unset (defaults to terraform)}"
+          echo "Detected owner of dev: $OWNER. Configured IAC_TOOL: $CONFIGURED."
+          echo "Detected owner of dev: **$OWNER**. Configured IAC_TOOL: **$CONFIGURED**." >> "$GITHUB_STEP_SUMMARY"
+          INTENT="${IAC_TOOL_CONFIGURED:-terraform}"
+          if [ "$OWNER" != "none" ] && [ "$OWNER" != "$INTENT" ]; then
+            echo "::notice::This destroy removes the $OWNER deployment of dev. A deploy with IAC_TOOL ($CONFIGURED) will work once the environment is empty."
+          fi
+          case "$INTENT" in
+            terraform | cloudformation) ;;
+            *) echo "::warning::IAC_TOOL '$IAC_TOOL_CONFIGURED' is not valid (terraform or cloudformation); it does not affect this destroy, but deployments will fail until it is fixed." ;;
+          esac
+
+      - name: Nothing is deployed
+        if: steps.owner.outputs.owner == 'none'
+        run: |
+          echo "Nothing is deployed in dev (no CloudFormation stack and no Terraform state with resources)."
+          echo "Nothing is deployed in dev." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Terraform
+        if: steps.owner.outputs.owner == 'terraform'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Terragrunt (checksum verified)
+        if: steps.owner.outputs.owner == 'terraform'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          base="https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo terragrunt_linux_amd64 "$base/terragrunt_linux_amd64"
+          curl -fsSLo SHA256SUMS "$base/SHA256SUMS"
+          grep " terragrunt_linux_amd64$" SHA256SUMS | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 terragrunt_linux_amd64 "$HOME/.local/bin/terragrunt"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Plan the destruction
+        if: steps.owner.outputs.owner == 'terraform'
+        run: |
+          set -o pipefail
+          terragrunt run --all -- plan -destroy -lock-timeout=300s 2>&1 | tee "$RUNNER_TEMP/destroy-plan.txt"
+
+      - name: Summary of what would be destroyed
+        if: steps.owner.outputs.owner == 'terraform'
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          {
+            echo "### Destroy DEV (mode: $MODE)"
+            echo ""
+            echo "Plan lines per unit:"
+            grep -E "Plan: [0-9]+ to add" "$RUNNER_TEMP/destroy-plan.txt" | sed -E 's/^[0-9:. ]*(STDOUT|STDERR) //' || echo "(no resources in the state)"
+            echo ""
+            echo "Resources that will be destroyed (first 150):"
+            grep -E "# .* will be destroyed" "$RUNNER_TEMP/destroy-plan.txt" | sed -E 's/^[0-9:. ]*(STDOUT|STDERR) //' | head -150 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MODE" != "destroy" ]; then
+            echo "Nothing was destroyed. To destroy, run this workflow again with mode destroy and the repository name in confirm."
+          fi
+
+      - name: Destroy
+        if: ${{ inputs.mode == 'destroy' && steps.owner.outputs.owner == 'terraform' }}
+        run: terragrunt run --all -- destroy -auto-approve -lock-timeout=300s
+
+      # Plan mode lists every stack in reverse deploy order with its status, resources, what it would retain and
+      # what blocks a delete. Destroy mode, per stack: termination protection off, empty the S3 buckets of that
+      # stack, delete-stack and wait for stack-delete-complete (ECR repositories empty themselves: EmptyOnDelete).
+      - name: Plan or destroy (CloudFormation)
+        if: steps.owner.outputs.owner == 'cloudformation'
+        working-directory: .
+        env:
+          MODE: ${{ inputs.mode }}
+        run: python3 scripts/cfn_deploy.py destroy --env dev --mode "$MODE"
